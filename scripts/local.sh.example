@@ -25,3 +25,5 @@ WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based: ssh-
 # POOL=2101248                # total pool positions (zig/patches/0008); with KV_SHARD=1, empty: two owner parts of a CONTEXT
 #                             # window each, derived; the same POOL costs about half the KV memory a Spark sharded
 # KV_SHARD_DECODE=fetch       # fetch (reference) or owner (owner-computed decode); empty: the engine's default
+# DISPLAY_KV_MIB=1792         # headless GB10 only (off when unset): KV on the framebuffer the UEFI reserves, owner planes first with
+#                             # KV_SHARD=1 (ezoushen's PR #9, zig/patches/0024-display-kv); DISPLAY_KV_CARD=/dev/dri/card0

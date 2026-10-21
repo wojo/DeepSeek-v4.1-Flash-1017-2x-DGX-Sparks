@@ -1,7 +1,7 @@
 # Deploying the port fork on gx10-a
 
-How the fork checkout that serves Robert's traffic is brought to a newer `spill-kvshard` (this branch, with the engine
-as the patch series `zig/patches/0011-...` to `0022-...`), and how it is rolled back. GPU work and anything on the
+How the fork checkout that serves Robert's traffic is brought to a newer `main` (this branch, with the engine as the
+patch series `zig/patches/0011-...` to `0022-...`), and how it is rolled back. GPU work and anything on the
 Sparks is the coordinator's: these are the steps it runs. Nothing here changes the stock checkout.
 
 ## What serves now
@@ -10,11 +10,11 @@ Sparks is the coordinator's: these are the steps it runs. Nothing here changes t
 | --- | --- |
 | unit | `deepseek1017.service` (oneshot, `RemainAfterExit=yes`, `TimeoutStartSec=7200`), enabled; `deepseek1017-watchdog.timer` restarts it after 3 failed `/health` checks, never while `~/.deepseek1017-hold` exists |
 | drop-in | `/etc/systemd/system/deepseek1017.service.d/fork.conf`: `WorkingDirectory`, `ExecStart` (`start.sh`), `ExecStartPost` (memguard from the fork dir) and `ExecStop` (`stop.sh`) point at **`~/DeepSeek-port`** |
-| fork checkout | `~/DeepSeek-port` on gx10-a: an earlier tree of this branch (or of the fork's `main`) with the fork's own `scripts/local.sh` |
+| fork checkout | `~/DeepSeek-port` on gx10-a: an earlier tree of this branch (or of the upstream `spill-kvshard`) with the fork's own `scripts/local.sh` |
 | image | `tensorfold-dsv41:exl3-tp2-99f490fc5c18` on both Sparks |
 | stock checkout | `~/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks`, untouched (the unit's own paths) |
 
-`spill-kvshard` already carries both local fixes of the stock tree (`compiler-mirror.patch`: `ZIG_MIRRORS`;
+This branch already carries both local fixes of the stock tree (`compiler-mirror.patch`: `ZIG_MIRRORS`;
 `worker-helper-image.patch`: the worker's helper containers use `$IMAGE`), so the fork needs no working-tree edits
 any more: only `scripts/local.sh`, which git ignores.
 
@@ -23,16 +23,16 @@ any more: only `scripts/local.sh`, which git ignores.
 Make the new tree beside the old one and swap the two folders, so the drop-in's path never changes and the old tree
 stays whole for a rollback.
 
-1. **On the Mac (no Spark involved).** The engine is in `zig/patches` already (the series `0011` to `0022`, then `0023`). Export
-   engine work made after it (on top of the engine's `port/series-pair-370daf0`) as `0024-...`, commit it on
-   `spill-kvshard`, then bundle the branch:
+1. **On the Mac (no Spark involved).** The engine is in `zig/patches` already (the series `0011` to `0022`, then `0023` and
+   ezoushen's display reserve `0024`). Export engine work made after it (on top of the engine's
+   `port/series-display-kv-pair-370daf0`) as `0025-...`, commit it on `main`, then bundle the branch:
 
    ```
    cd ~/GitHub/deepseek1017-recipe-port
-   scripts/port-patches.sh --base port/series-pair-370daf0 --branch <engine branch> --dry-run   # then without --dry-run
+   scripts/port-patches.sh --base port/series-display-kv-pair-370daf0 --branch <engine branch> --dry-run   # then without --dry-run
    bash scripts/port_test.sh && python3 -I tools/selftest.py      # the golden start.sh test skips here: step 4
-   git add zig/patches && git commit -m "zig/patches: 0024-... = <engine branch> <hash>"
-   git bundle create ~/port-recipe.bundle spill-kvshard
+   git add zig/patches && git commit -m "zig/patches: 0025-... = <engine branch> <hash>"
+   git bundle create ~/port-recipe.bundle main
    scp ~/port-recipe.bundle gx10-a:
    ```
 
@@ -54,10 +54,10 @@ stays whole for a rollback.
 3. **The new tree**, a clean checkout of the bundle, with the fork's own settings:
 
    ```
-   git clone --quiet --branch spill-kvshard ~/port-recipe.bundle ~/DeepSeek-port.next
+   git clone --quiet --branch main ~/port-recipe.bundle ~/DeepSeek-port.next
    cp -p ~/DeepSeek-port/scripts/local.sh ~/DeepSeek-port.next/scripts/local.sh
    [ -f ~/DeepSeek-port/.env ] && cp -p ~/DeepSeek-port/.env ~/DeepSeek-port.next/.env
-   ls ~/DeepSeek-port.next/zig/patches/       # 0001 0002 0004 0005 0006 0008 0010, then 0011 to 0023: one port only
+   ls ~/DeepSeek-port.next/zig/patches/       # 0001 0002 0004 0005 0006 0008 0010, then 0011 to 0024: one port only
    ```
 
    Only one copy of the port may be in `zig/patches` (an older `0007-...` or `0011-spill-kvshard.patch` export and the

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Display-reserve KV, `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only), by **ezoushen**
+  ([pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9), its patch `0007-display-kv` ported as
+  `zig/patches/0024-display-kv.patch`): the KV caches on the framebuffer the UEFI reserves, so their bytes leave the host's `MemAvailable`
+  (the GLM-5.3-Flash recipe's display-KV idea). With `KV_SHARD=1` each Spark puts its own part's compressed planes (the owner rows) there first and
+  the replicated index keys and raw stores after them; each rank logs at start how many MiB went to the reserve and how many to normal memory.
+  Measured in #9 on the stock recipe (replicated KV, 893 MiB a rank, all of it on the framebuffer): the head's idle `MemAvailable` went from
+  6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19); `tools/exact.py`
+  31 of 31 cases identical with it on and off. Measured on this pair with the port's sharded pool: at `POOL=5218304` with `DISPLAY_KV_MIB=1792` each rank put 1,791 MiB (all of its owner planes) on the reserve and 852 MiB in normal memory; `tools/exact.py` 39 of 39 identical; the lowest `MemAvailable` during a 227,640-token prompt was 6.57 / 8.32 GiB, against 6.44 / 8.22 GiB for 2,101,248 positions without the reserve. The engine now also refuses at start, with the numbers,
+  a window its RoPE tables (1,114,112 positions) do not cover; a stream's positions are its own, so a larger `POOL` never needs longer tables.
+
 - **Rank 0's memory with long prompts:** `zig/patches/0023-server-prepare-memory.patch`, a fix to the base engine after
   the port's series (also offered alone as its own pull request). A prompt's render and tokenization kept their scratch
   in the request's memory until the reply ended: a resumed ~948K-token conversation held ~1.3-1.5 GB on rank 0, and

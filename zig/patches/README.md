@@ -25,6 +25,7 @@ Patches to BertholomusAI's TensorFold fork at `TF_REF` (`scripts/config.sh`), ap
 | `0021-dsv41-spill-pictures.patch` | `TF_DS_IMAGE_CACHE=0` turns it off (with 0006) | on with `SPILL_GIB` | spill v2 for prompts with pictures: a point records each picture's span and full SHA-256 (manifest version 3); every rank counts its own |
 | `0022-dsv41-kv-shard-ring.patch` | `TF_DS_KV_SHARD_RING`, `KV_SHARD_DECODE=auto`, `TF_DS_KV_SHARD_COST`, `TF_DS_KV_SHARD_OVERLAP` (with `KV_SHARD=1`) | on with `KV_SHARD` | the sharded decode's exchanges on the RDMA ring, sized to the rows that cross (decode ~1-4 % below unsharded; 10-12 % on NCCL before) |
 | `0023-server-prepare-memory.patch` | `TENSORFOLD_PREPARE_FLOOR_GIB` (rank 0; GiB, `0` turns the gate off) | **on** (3 GiB) | not the port's: a fix to the base engine. A long prompt's render and tokenization give their scratch back, and a prepare waits under a memory floor while others are in flight: eight resumed ~1M-token conversations no longer take rank 0's MemAvailable to zero. Also offered alone as its own pull request; whichever lands first, the other copy goes |
+| `0024-display-kv.patch` | `DISPLAY_KV_MIB`, `DISPLAY_KV_CARD` (`TF_DS_DISPLAY_KV_MIB`, `TF_DS_DISPLAY_KV_CARD`; both ranks) | off | display-reserve KV **by ezoushen**, [pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9) (his `0007-display-kv`): the KV caches on the framebuffer a **headless** GB10 reserves (UEFI, about 1.75 GiB a GPU), so those bytes leave `MemAvailable`; with `KV_SHARD=1` each Spark's owner planes go there first. His `display.zig` as he wrote it, its wiring ported onto `0008`'s pool and the port's KV sharding (measured on the pair at `POOL=5218304` and 1,792 MiB: 1,791 MiB a rank on the reserve, `tools/exact.py` 39/39 identical) |
 
 With every switch unset, for requests without a `tool_choice` and for prompts shorter than 131,072 tokens, the engine behaves like the pinned one (the indexer split above that keeps the bits: a 399,516-token prompt's greedy reply has the same token hash) (`tools/exact.py` compares token hashes; bit-identity verified for 0001 and 0002 on the earlier pin; 0004 is checked by the same replay; the image of the current pin was not run on a pair). Remove a patch from
 this folder to leave it out of the image; never run `scripts/prepare.sh` to rebuild with a partial cache.
@@ -36,14 +37,15 @@ measured on the pair and whose work it is, as the GLM recipe's patches do. They 
 `port/series-pair-370daf0` (local to the port's engine repository) over `baseline-370daf0` (TF_REF plus the patches above, `0008`
 and `0010` included), without the port's own notes (`PORT.md`, `docs/port/`); the branch's last commit is `0023`, a fix to the base engine that is not the port's (rank 0's memory with long prompts; also
 offered alone as its own pull request, with the same bytes as this fork's other copy, so whichever lands first the other is
-dropped as a duplicate). Each passes
+dropped as a duplicate). `0024` is ezoushen's display reserve on top of the series (engine `port/series-display-kv-pair-370daf0`, one
+commit on `port/series-pair-370daf0`), hand-written with a header like the others. Each passes
 `git apply --check` on a clean `TF_REF` checkout after the ones before it and gives that commit's tree. Remove them from the last one
 back, never one in the middle (each builds on those before it). KV sharding builds on `0008`'s pool: one `POOL`, cut into one part a
 Spark when `KV_SHARD=1`. Every switch of these patches is off by default, in the engine and in the recipe (`SPILL_GIB=0`,
 `KV_SHARD=0`, `POOL` empty: the recipe as before the port), but for `0020`'s broken-pair exit, which acts only after a
 failure; set them in `scripts/local.sh` to turn them on. The recipe's settings for
 them are in `scripts/port.sh`, and [docs/PORT-RECIPE.md](../../docs/PORT-RECIPE.md) has their mapping, deployment and rollback.
-Engine work after the series is exported on top by `scripts/port-patches.sh --base port/series-pair-370daf0` as `0024-...` and later,
+Engine work after `0024` is exported on top by `scripts/port-patches.sh --base port/series-display-kv-pair-370daf0` as `0025-...` and later,
 never by hand: it refuses unless the patches here reproduce its base and every new patch applies on a clean `TF_REF` and reproduces
 the branch, and it rewrites only the table rows it owns (marked `<!-- port-patches -->`). `scripts/port-patches.sh --dry-run` checks
 without writing.

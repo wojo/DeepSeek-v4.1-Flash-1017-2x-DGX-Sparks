@@ -21,6 +21,11 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
 
 ## Engine
 
+- **Display-reserve KV** (`DISPLAY_KV_MIB`, `DISPLAY_KV_CARD`; the engine's `display.zig`, carried in `zig/patches/0024-display-kv.patch`) was authored by
+  **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in [pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9)
+  of this repository (patch `0007-display-kv`, commits `0f33c49` and `24e1f1f`): a port of the DRM-framebuffer backend of Mia's AI Lab's TensorFold GLM engine
+  (`glm_cuda/cuda_display_kv.zig`, itself from the TensorFold contributors) to this engine's KV caches, Apache-2.0. `display.zig` is carried as he wrote it; its
+  wiring into the caches was ported by Robert Wojciechowski ([@rwojo](https://x.com/rwojo) on X) onto the pool/window split and KV sharding (each Spark's owner planes placed on the framebuffer first).
 - **[TensorFold](https://github.com/ashhart/TensorFold)** by Ash Hart ([ashhart](https://github.com/ashhart)) and the
   TensorFold contributors (Apache-2.0): the native Zig engine, its OpenAI-compatible server, its lane core, CUDA runtime,
   Triton AOT loader and EXL3 module.
