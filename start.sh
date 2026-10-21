@@ -9,8 +9,11 @@
 #
 # Usage: ./start.sh [restart] [extra tensorfold-native serve args]
 #   ./start.sh                  # scripts/config.sh's defaults (4 requests at once, a 1,048,576-token window, drafts,
-#                               # images); if the server already runs, says so and leaves it alone
-#   SPILL_GIB=64 KV_SHARD=1 ./start.sh restart   # the ported spill v2 and KV sharding on, as the pair was validated
+#                               # images) and this fork's: spill v2 at 64 GiB a Spark, KV sharding and the display
+#                               # reserve (DISPLAY_KV_MIB=1792) over a 5,218,304-position pool (2,101,248 without the
+#                               # reserve), each left out of a start it cannot run in; if the server already runs,
+#                               # says so and leaves it alone
+#   SPILL_GIB=0 KV_SHARD=0 DISPLAY_KV_MIB=0 ./start.sh restart   # this fork's defaults off: the recipe as before the port
 #   ./start.sh restart          # stop both ranks (./stop.sh), then start again (e.g. after changing settings)
 #   CONTEXT=262144 ./start.sh restart
 #   ABLIT=1 ./start.sh restart   # Mia EAQ 2.9 bpw + Keys overlay; requires your HF token and gated repo access
@@ -31,14 +34,14 @@
 #            them, and a start waits up to MIN_AVAIL_WAIT_S for them to drain), MEMGUARD_GIB (kill a rank's container
 #            below it), HEAD_NFS_SERVER,
 #            HEAD_NFS_VOLUME (rank 0 reads the checkpoint over NFS through a docker volume)
-#   port     SPILL_GIB (default 0: off), SPILL_DIR, WORKER_SPILL_DIR, SPILL_FLOOR_GIB, SPILL_QUOTA_GIB, SPILL_MIN_TOKENS,
-#            SPILL_STAGING_MIB, SPILL_TURNS, SPILL_FLUSH_MS, SPILL_WEIGHTS_SHA, KV_SHARD (default 0: off), KV_SHARD_DECODE,
-#            KV_SHARD_CARRY, KV_SHARD_TWINS, KV_SHARD_CHECK (with KV_SHARD=1 an empty POOL is the pool it needs): the
-#            ported spill v2 / KV sharding, OFF by default (scripts/port.sh, docs/PORT-RECIPE.md). Set explicitly, a
-#            setting that cannot run (a Spark's spill folder fails its checks) refuses; a fork's default that cannot
-#            starts without it and warns. Both ranks get the same values, the spill tier's identity
-#            (derived from the image and the pins), and each its own local spill directory at /spill. Spill settings
-#            are never extra arguments (refused: rank 1 would not get them)
+#   port     SPILL_GIB (this fork: 64; 0: off), SPILL_DIR, WORKER_SPILL_DIR, SPILL_FLOOR_GIB, SPILL_QUOTA_GIB,
+#            SPILL_MIN_TOKENS, SPILL_STAGING_MIB, SPILL_TURNS, SPILL_FLUSH_MS, SPILL_WEIGHTS_SHA, KV_SHARD (this fork: 1;
+#            0: off), KV_SHARD_DECODE, KV_SHARD_CARRY, KV_SHARD_TWINS, KV_SHARD_CHECK (with KV_SHARD=1 an empty POOL is
+#            the pool it needs): the ported spill v2 / KV sharding, off upstream and on by default in this fork
+#            (scripts/port.sh, docs/PORT-RECIPE.md). Set explicitly, a setting that cannot run (a Spark's spill folder
+#            fails its checks) refuses; this fork's default that cannot starts without it and warns. Both ranks get the
+#            same values, the spill tier's identity (derived from the image and the pins), and each its own local spill
+#            directory at /spill. Spill settings are never extra arguments (refused: rank 1 would not get them)
 #   ranks    TENSORFOLD_*, TF_DS_* and TF_SPILL_* go to both ranks, except values mapped from recipe settings (use POOL, not TF_DS_POOL)
 #            every other exported NCCL_* variable too (values of A-Z a-z 0-9 _ . , : = / - only), RANK1_PROFILE=1|2: rank 1's --profile
 set -euo pipefail
@@ -81,6 +84,8 @@ port_validate
 # above SPILL_FLOOR_GIB; created when missing (DRY_RUN: not). Checked here, before the flags, the variables and the
 # tf.recipe.port label are made and before a running pair is compared with them: a spill tier that is on by default
 # only and fails here is off for this start (a warning), an explicit SPILL_GIB that fails refuses. Nothing with SPILL_GIB=0.
+port_display_check   # Robert's fork: the display reserve on by default degrades (scripts/port.sh)
+[[ -z "${PORT_DISPLAY_WHY:-}" ]] || warn "DISPLAY RESERVE OFF for this start: $PORT_DISPLAY_WHY (the first start could not map it; this one runs without it)"
 port_spill_check
 port_map
 port_check_extra "$@"
@@ -219,6 +224,18 @@ if (( ! DRY )); then
 fi
 
 # ---------------------------------------------------------------- 3. launch
+# a default display reserve the engine could not map (DisplayShort...): once more without it, the derived pool with it
+# (the load loop and, with FOREGROUND=1, foreground: exec keeps the PID, so a supervisor's main process carries on)
+display_retry() {
+  local logs
+  logs="$(docker logs --tail 200 "$CONTAINER_NAME" 2>&1; worker 1 docker logs --tail 200 "$CONTAINER_NAME" 2>&1 || true)"
+  port_display_load_failed "$logs" || return 0
+  [[ -z "${LOGS_PID:-}" ]] || kill "$LOGS_PID" 2>/dev/null || true
+  why=$(grep -oE -m1 "$PORT_DISPLAY_ERRORS" <<<"$logs")
+  warn "DISPLAY RESERVE OFF for this start: a rank could not map it ($why); starting again without it (DISPLAY_KV_MIB=0)"
+  exec 8>&-
+  exec env DISPLAY_KV_MIB=0 PORT_DISPLAY_WHY="$why" "$BASH" "$0" restart "$@"
+}
 # FOREGROUND=1: stay attached to rank 0's log and exit with its code, so that a supervisor (systemd's Restart=on-failure)
 # can restart the server. Either rank ending takes the other one down: a lone rank waits for its peer forever. SIGINT and
 # SIGTERM run ./stop.sh. Note the supervisor restarts a start that was killed by memguard too; give it a RestartSec.
@@ -241,6 +258,7 @@ foreground() {
   w=0; wait "$watch" || w=$?
   code=$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME" 2>/dev/null || echo 1)
   [[ "$w" != 1 || "$code" != 0 ]] || code=1         # the worker's rank failed, even if rank 0 then shut down cleanly
+  (( code == 0 )) || display_retry "$@"             # a default display reserve a rank could not map, as the load loop
   worker 1 "docker stop -t ${STOP_TIMEOUT:-30} '$CONTAINER_NAME'" >/dev/null 2>&1 || true
   exit "$code"
 }
@@ -302,7 +320,7 @@ here+=("${NCCL_ARGS[@]}" "$IMAGE" "${SERVE[@]}")
 if (( DRY )); then printf '[dry-run] rank 0 here:\n  %s\n' "$(printf '%q ' "${here[@]}")"; exit 0; fi
 log "Rank 0 here: ${SERVE[*]}"
 "${here[@]}" >/dev/null
-[[ "${FOREGROUND:-0}" != 1 ]] || foreground
+[[ "${FOREGROUND:-0}" != 1 ]] || foreground "$@"
 
 # ---------------------------------------------------------------- 4. load
 step 4 "Loading: ~98 GiB of weights on each Spark, then Engram and the caches (a few minutes)"
@@ -316,6 +334,7 @@ fail() {
 }
 start=$SECONDS
 until curl -sf --max-time 5 "${AUTH[@]}" "$URL/v1/models" >/dev/null 2>&1; do
+  running_here && running_worker 1 || display_retry "$@"
   running_here || fail "rank 0 exited (code $(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER_NAME")) before it was ready"
   running_worker 1 || fail "rank 1 on $(worker_host 1) exited before the server was ready"
   (( SECONDS - start < WAIT_TIMEOUT )) || fail "not ready after ${WAIT_TIMEOUT}s (WAIT_TIMEOUT); the ranks are still running"

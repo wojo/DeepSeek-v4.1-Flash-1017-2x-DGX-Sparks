@@ -1,10 +1,10 @@
 # The ported engine features' settings (wojo's GLM patches 0088/0110/0111 spill v2, 0118 KV sharding, 0119 parked
 # pages, carried into the native dsv41 engine as zig/patches/0011-... to 0022-...): their defaults, their checks, and the ONE place
 # they map to the engine's flags and variables (port_map). Sourced by scripts/config.sh after the serving settings;
-# start.sh and stop.sh call the functions. Every feature is OFF by default (PORT_SPILL_DEFAULT_GIB, PORT_SHARD_DEFAULT
-# below: SPILL_GIB=0, KV_SHARD=0, POOL empty): with them off nothing below adds a flag, a variable, a mount or a label
-# value that differs from the recipe before the port, and both ranks run as before. Set them in scripts/local.sh to turn
-# them on. A fork may turn a default on by changing those two values; such a default that cannot run here is turned off
+# start.sh and stop.sh call the functions. Upstream every feature is OFF by default (PORT_SPILL_DEFAULT_GIB,
+# PORT_SHARD_DEFAULT below: SPILL_GIB=0, KV_SHARD=0, POOL empty): with them off nothing below adds a flag, a variable, a
+# mount or a label value that differs from the recipe before the port, and both ranks run as before. This fork turns
+# both defaults on (PORT_SPILL_DEFAULT_GIB=64, PORT_SHARD_DEFAULT=1); a default that cannot run here is turned off
 # with a warning (port_validate, port_spill_check: spill when a Spark's spill folder fails its checks, KV sharding when
 # the setup is not two Sparks or an explicit POOL does not fit it), while the same setting given explicitly refuses.
 # The pool is zig/patches/0008's single POOL setting (config.sh; start.sh gives both ranks TF_DS_POOL, TF_DS_WINDOW and
@@ -18,9 +18,10 @@
 # Spill tier (GLM 0088 + 0110 spill v2, 0111 continuation; BadAd84's block-tier design): kept prompt states written to
 # each Spark's own local disk when they are kept, in shared 2,048-token blocks, and read back instead of a new prefill,
 # also after a restart or a crash.
-#   SPILL_GIB        the cap a Spark (GiB, decimals allowed; 64 is what the pair was validated with). Default 0: off.
-#                    Set explicitly (SPILL_GIB or TF_DS_SPILL_GIB), a Spark whose spill folder fails the checks below
-#                    refuses the start; a fork default above 0 starts the pair without the tier there (a loud warning)
+#   SPILL_GIB        the cap a Spark (GiB, decimals allowed; 64 is what the pair was validated with). Default 64 in
+#                    this fork (0 upstream: off). Set explicitly (SPILL_GIB or TF_DS_SPILL_GIB), a Spark whose spill
+#                    folder fails the checks below refuses the start; a fork default above 0 starts the pair without
+#                    the tier there (a loud warning)
 #   SPILL_DIR        rank 0's local directory, mounted at /spill (default: beside HF_CACHE, never inside it: HF_CACHE is
 #                    the NFS export the worker reads). Must be on a local disk, owned by you, outside the NFS export,
 #                    the model, Engram and weight-file folders and any archive folder; start.sh checks all of that
@@ -44,8 +45,9 @@
 # KV_SHARD=1:    each conversation's compressed latents stored once, on the Spark whose part of the pool holds it
 #                (GLM 0118): the same POOL costs about half the KV memory a Spark (measured at 2,101,248 positions:
 #                1,062 MiB a rank against 1,783 MiB replicated), for 1-4% decode. Needs a pool of two owner parts each
-#                holding a whole CONTEXT window. Default 0 (off). Set explicitly (KV_SHARD or TF_DS_KV_SHARD), a setup it
-#                cannot run on refuses; a fork default of 1 is turned off with a warning there instead
+#                holding a whole CONTEXT window. Default 1 in this fork (0 upstream: off). Set explicitly (KV_SHARD or
+#                TF_DS_KV_SHARD), a setup it cannot run on refuses; a fork default of 1 is turned off with a warning
+#                there instead
 # KV_SHARD_DECODE: fetch (the reference: the owner sends the rows decode picks) or owner (owner-computed decode);
 #                empty: the engine's default (fetch)
 # KV_SHARD_CARRY: 1 (default): a kept conversation whose part is full is carried into the other part, and live streams
@@ -71,8 +73,8 @@
 # that cannot run degrades, an explicit one refuses.
 PORT_SPILL_EXPLICIT=0; [[ -z "${SPILL_GIB:-}${TF_DS_SPILL_GIB:-}" ]] || PORT_SPILL_EXPLICIT=1
 PORT_SHARD_EXPLICIT=0; [[ -z "${KV_SHARD:-}${TF_DS_KV_SHARD:-}" ]] || PORT_SHARD_EXPLICIT=1
-PORT_SPILL_DEFAULT_GIB=0   # the spill tier's cap a Spark when SPILL_GIB is not set (0: off)
-PORT_SHARD_DEFAULT=0       # KV_SHARD when it is not set (0: off)
+PORT_SPILL_DEFAULT_GIB=64  # the spill tier's cap a Spark when SPILL_GIB is not set (0: off). Robert's fork: on
+PORT_SHARD_DEFAULT=1       # KV_SHARD when it is not set (0: off). Robert's fork: on
 SPILL_GIB="${SPILL_GIB:-${TF_DS_SPILL_GIB:-$PORT_SPILL_DEFAULT_GIB}}"
 SPILL_DIR="${SPILL_DIR:-$(dirname "$HF_CACHE")/dsv41-tensorfold-spill}"
 WORKER_SPILL_DIR="${WORKER_SPILL_DIR:-$SPILL_DIR}"
@@ -112,7 +114,23 @@ port_spill_on() { port_num "$SPILL_GIB" && port_gt0 "$SPILL_GIB"; }
 # port_validate takes its derived pool with it.
 port_pool_set() {
   if [[ -n "$POOL" ]]; then echo "$POOL"
-  elif [[ "$KV_SHARD" == 1 && "$CONTEXT" =~ ^[1-9][0-9]{0,8}$ && "$(port_rows)" =~ ^[0-9]{1,3}$ ]]; then port_shard_pool; fi
+  elif [[ "$KV_SHARD" == 1 && "$CONTEXT" =~ ^[1-9][0-9]{0,8}$ && "$(port_rows)" =~ ^[0-9]{1,3}$ ]]; then
+    if port_display_on; then port_display_pool; else port_shard_pool; fi
+  fi
+}
+# The display reserve (DISPLAY_KV_MIB, ezoushen's #9) with KV_SHARD=1: the pool whose owner planes fill it. Measured on the
+# pair: 1,792 MiB holds the owner planes of 5,218,304 positions a rank (1,791 of 1,791 MiB on the reserve; exact.py 39/39;
+# the lowest MemAvailable during a 227,640-token prompt 6.57 / 8.32 GiB, against 6.44 / 8.22 for 2,101,248 without the
+# reserve). Scaled to DISPLAY_KV_MIB in whole 4,096-position parts, never below port_shard_pool nor above 16x CONTEXT.
+PORT_DISPLAY_POOL_AT_1792=5218304
+port_display_on() { [[ "${DISPLAY_KV_MIB:-0}" =~ ^[0-9]+$ ]] && (( 10#${DISPLAY_KV_MIB:-0} > 0 )); }
+port_display_pool() {
+  local p min max
+  p=$(( PORT_DISPLAY_POOL_AT_1792 * 10#$DISPLAY_KV_MIB / 1792 / 4096 * 4096 ))
+  min=$(port_shard_pool); max=$(( 16 * CONTEXT / 4096 * 4096 ))
+  (( p <= max )) || p=$max
+  (( p >= min )) || p=$min
+  echo "$p"
 }
 port_pool()  { local p; p=$(port_pool_set); echo "${p:-$CONTEXT}"; }
 port_rows()  { echo "${ROUND_ROWS:-16}"; }
@@ -192,7 +210,8 @@ port_validate() {
   local bpp=$PORT_POOL_BYTES_PER_POS; [[ "$KV_SHARD" != 1 ]] || bpp=$PORT_POOL_BYTES_PER_POS_SHARDED
   est=$(awk -v p="$pool" -v b="$bpp" 'BEGIN {printf "%.1f", p * b / 1073741824}')
   (( pool <= 16 * CONTEXT )) || die "POOL ($pool) is more than 16x CONTEXT ($CONTEXT): ~$est GiB a Spark for the pool's state (estimated, ~$bpp bytes a position), out of the memory the weights leave. Lower POOL"
-  (( pool <= 4 * CONTEXT )) || warn "POOL ($pool) is more than 4x CONTEXT ($CONTEXT): ~$est GiB a Spark for the pool's state (estimated, ~$bpp bytes a position); watch MemAvailable against MEMGUARD_GIB"
+  # (a pool derived for the display reserve is sized to what the reserve takes off the host: no warning for it)
+  (( pool <= 4 * CONTEXT )) || { [[ -z "$POOL" ]] && port_display_on; } || warn "POOL ($pool) is more than 4x CONTEXT ($CONTEXT): ~$est GiB a Spark for the pool's state (estimated, ~$bpp bytes a position); watch MemAvailable against MEMGUARD_GIB"
   port_num "$SPILL_GIB" || die "SPILL_GIB is a number of GiB (0: off), not $SPILL_GIB"
   port_num "$SPILL_FLOOR_GIB" || die "SPILL_FLOOR_GIB is a number of GiB, not $SPILL_FLOOR_GIB"
   port_num "$SPILL_QUOTA_GIB" || die "SPILL_QUOTA_GIB is a number of GiB (0: no quota), not $SPILL_QUOTA_GIB"
@@ -621,4 +640,47 @@ port_spill_fix_both() {
   spill_fix_owner "${PORT_SPILL_REAL[0]}" "$IMAGE" 1 || warn "could not give rank 0's spill files back to you in ${PORT_SPILL_REAL[0]}"
   worker 1 "$(declare -f spill_fix_target spill_fix_owner); spill_fix_owner '${PORT_SPILL_REAL[1]}' '$IMAGE' 1" ||
     warn "could not give rank 1's spill files back to you in ${PORT_SPILL_REAL[1]} on $(worker_host 1)"
+}
+
+# ---------------------------------------------------------------- the display reserve as a default (Robert's fork)
+# DISPLAY_KV_MIB on by default (scripts/config.sh) must degrade, never fail: left at the default, a Spark whose card has a
+# connected display, or no such card, starts the pair without it (port_display_check, before anything is stopped), and
+# a reserve the engine cannot map (DisplayShort and the rest, at load) makes start.sh start once more without it
+# (port_display_load_failed). Either way DISPLAY_KV_MIB becomes 0, so an empty POOL is the 2,101,248 sharded default.
+# Set explicitly, nothing here runs: the engine refuses, as before.
+# display_probe <card> [<sysfs>]: one line about this node (self-contained: start.sh sends it to the worker): OK, NOCARD
+# <card>, or CONNECTED <connector> (any /sys/class/drm/card*-*/status that reads "connected", on any card)
+display_probe() {
+  local card=$1 sys=${2:-/sys/class/drm} f st
+  [ -c "$card" ] || { echo "NOCARD $card"; return 0; }
+  for f in "$sys"/card*-*/status; do
+    [ -r "$f" ] || continue
+    st=$(tr -d ' \t\r\n' < "$f" 2>/dev/null)
+    [ "$st" != connected ] || { f=${f%/status}; echo "CONNECTED ${f##*/}"; return 0; }
+  done
+  echo OK
+}
+# port_display_default_off <reason>: say so loudly; the start goes on without the reserve on both ranks
+port_display_default_off() {
+  warn "DISPLAY RESERVE OFF for this start: $1. The display reserve is on by default (DISPLAY_KV_MIB=$DISPLAY_KV_MIB) and needs a headless card on BOTH Sparks; the server starts without it (its KV caches in normal memory) and, with POOL empty, with the sharded default pool. Set DISPLAY_KV_MIB=0 to silence this, or DISPLAY_KV_MIB explicitly to make it a refusal"
+  DISPLAY_KV_MIB=0
+}
+# port_display_check: before anything is stopped (start.sh, after port_validate)
+port_display_check() {
+  port_display_on && (( ! PORT_DISPLAY_EXPLICIT )) || return 0
+  local line
+  line=$(display_probe "$DISPLAY_KV_CARD")
+  case "$line" in OK) ;; *) port_display_default_off "this Spark: ${line/NOCARD/no DRM card node}"; return 0 ;; esac
+  if [[ -n "${WORKER_DOWN[1]:-}" ]]; then warn "DRY_RUN: the worker cannot be reached: its display reserve is not checked"; return 0; fi
+  if ! line=$(worker 1 "$(declare -f display_probe); display_probe '$DISPLAY_KV_CARD'" 2>/dev/null); then
+    port_display_default_off "could not check the display on $(worker_host 1)"; return 0
+  fi
+  case "$line" in OK) ;; *) port_display_default_off "$(worker_host 1): ${line/NOCARD/no DRM card node}" ;; esac
+}
+# port_display_load_failed <rank logs>: 0 when a rank failed to load because of the display reserve (the engine's
+# display.zig errors), and the reserve is only a default here, so start.sh may start once more without it
+PORT_DISPLAY_ERRORS='Display(Short|CreateDumb|MapDumb|CardUnavailable|NotContiguous|Mmap|Connected|AlreadyAllocated|TooLarge|TooManyTensors|LayoutChanged)'
+port_display_load_failed() {
+  port_display_on && (( ! PORT_DISPLAY_EXPLICIT )) && [[ -z "${PORT_DISPLAY_WHY:-}" ]] || return 1
+  grep -qE "$PORT_DISPLAY_ERRORS" <<<"$1"
 }

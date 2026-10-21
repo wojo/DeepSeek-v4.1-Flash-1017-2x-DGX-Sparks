@@ -37,15 +37,10 @@ case_() {
 # expect <a> <b>: inside a case, exit 1 when they differ
 expect='expect() { [[ "$1" == "$2" ]] || { echo "got  [$1]"; echo "want [$2]"; exit 1; }; }'
 
-# ---- defaults: everything off (the recipe before the port)
-case_ "defaults: everything off, nothing added, POOL left empty" 0 "unset SPILL_GIB KV_SHARD POOL STOP_TIMEOUT" "$expect
-  expect \"\$PORT_SPILL_EXPLICIT \$PORT_SHARD_EXPLICIT \$SPILL_GIB \$KV_SHARD\" '0 0 0 0'
-  port_validate; port_map
-  expect \"\${#PORT_ENV[@]} \${#PORT_SERVE[@]} [\$POOL]\" '0 0 []'
-  expect \"\$(port_identity)\" off
-  expect \"\$(port_summary)\" ''
-  expect \"\${STOP_TIMEOUT:-unset}\" unset
-  expect \"\$PORT_MAPPED_RE\" \"\$PORT_MAPPED_BASE\""
+# ---- Robert's defaults (this fork's main): spill 64 GiB a Spark, KV sharding, the derived pool; the PR branch's are off
+case_ "Robert's defaults: spill 64 GiB, KV shard, the derived pool (2,101,248 without the display reserve)" 0 "unset SPILL_GIB KV_SHARD POOL STOP_TIMEOUT DISPLAY_KV_MIB" "$expect
+  expect \"\$PORT_SPILL_DEFAULT_GIB \$PORT_SHARD_DEFAULT \$PORT_SPILL_EXPLICIT \$PORT_SHARD_EXPLICIT \$SPILL_GIB \$KV_SHARD\" '64 1 0 0 64 1'
+  port_validate; port_map; expect \"\$POOL\" 2101248"
 # ---- a fork's defaults on (Robert's: spill 64 GiB a Spark, KV sharding, the pool from CONTEXT)
 case_ "fork defaults: spill 64 GiB, KV shard, the derived 2101248 pool" 0 "PT_FORK=1; unset SPILL_GIB KV_SHARD POOL STOP_TIMEOUT" "$expect
   expect \"\$PORT_SPILL_EXPLICIT \$PORT_SHARD_EXPLICIT\" '0 0'
@@ -479,6 +474,67 @@ check_ "POOL: the derived sharding pool goes through start.sh's 0008 mapping, on
   [[ "$(grep -c "^TF_DS_POOL=" <<<"$all")" == 1 && "$(grep -c "^TF_DS_WINDOW=" <<<"$all")" == 1 ]] || { echo "TF_DS_POOL / TF_DS_WINDOW not exactly once: $all"; exit 1; }
   grep -qx "TF_DS_POOL=2101248" <<<"$all" && grep -qx "TF_DS_WINDOW=1048576" <<<"$all" && grep -qx "TF_DS_KV_SHARD=1" <<<"$all" || { echo "$all"; exit 1; }
   [[ "$FOLLOW" == "--pool 2101248 --streams 4 "* ]] || { echo "rank 1: $FOLLOW"; exit 1; }'
+# ---- the display reserve as Robert's default: it degrades, never fails (scripts/port.sh port_display_*)
+case_ "display default: the derived pool fills the reserve (5,218,304 at 1792 MiB), scaled, bounded, 2,101,248 when off" 0 "unset POOL; DISPLAY_KV_MIB=1792 PORT_DISPLAY_EXPLICIT=0" "$expect
+  port_validate | grep -q 'more than 4x' && { echo 'warned 4x for the display pool'; exit 1; }
+  expect \"\$(port_pool)\" 5218304
+  DISPLAY_KV_MIB=896; expect \"\$(port_pool)\" 2609152
+  DISPLAY_KV_MIB=256; expect \"\$(port_pool)\" 2101248
+  DISPLAY_KV_MIB=2032; CONTEXT=262144; expect \"\$(port_pool)\" 4194304
+  CONTEXT=1048576; DISPLAY_KV_MIB=0; expect \"\$(port_pool)\" 2101248
+  DISPLAY_KV_MIB=1792; KV_SHARD=0; expect \"\$(port_pool)\" 1048576
+  KV_SHARD=1; POOL=3145728; expect \"\$(port_pool)\" 3145728"
+case_ "display probe: OK headless, CONNECTED names the connector, NOCARD without the node" 0 "" "$expect
+  t=\$(mktemp -d); trap 'rm -rf \"\$t\"' EXIT
+  mkdir -p \"\$t/card0-HDMI-A-1\" \"\$t/card0-DP-1\" \"\$t/card1-DP-2\"
+  echo disconnected > \"\$t/card0-HDMI-A-1/status\"; echo unknown > \"\$t/card0-DP-1/status\"; echo disconnected > \"\$t/card1-DP-2/status\"
+  expect \"\$(display_probe /dev/null \"\$t\")\" OK
+  echo connected > \"\$t/card1-DP-2/status\"; expect \"\$(display_probe /dev/null \"\$t\")\" 'CONNECTED card1-DP-2'
+  expect \"\$(display_probe /dev/dri/card9 \"\$t\")\" 'NOCARD /dev/dri/card9'"
+dstubs='DISPLAY_KV_CARD=/dev/dri/card0; worker_host() { echo w; }'
+case_ "display default: a connected display on the worker turns it off for the start, with the 2,101,248 pool" 0 "unset POOL; DISPLAY_KV_MIB=1792 PORT_DISPLAY_EXPLICIT=0" "$expect; $dstubs
+  display_probe() { echo OK; }; worker() { echo 'CONNECTED card0-HDMI-A-1'; }
+  out=\$(port_display_check 2>&1); grep -q 'WARN: DISPLAY RESERVE OFF for this start: w: CONNECTED card0-HDMI-A-1' <<<\"\$out\" || { echo \"\$out\"; exit 1; }
+  port_display_check >/dev/null 2>&1; port_validate >/dev/null; port_map; expect \"\$DISPLAY_KV_MIB \$POOL\" '0 2101248'"
+case_ "display default: no card here, or the worker's probe fails: off" 0 "DISPLAY_KV_MIB=1792 PORT_DISPLAY_EXPLICIT=0" "$expect; $dstubs
+  display_probe() { echo 'NOCARD /dev/dri/card0'; }; worker() { echo OK; }
+  port_display_check 2>&1 | grep -q 'OFF for this start: this Spark: no DRM card node /dev/dri/card0' || exit 1
+  ( display_probe() { echo OK; }; worker() { return 255; }; port_display_check >/dev/null 2>&1; expect \$DISPLAY_KV_MIB 0 ) || exit 1
+  display_probe() { echo OK; }; worker() { echo OK; }; port_display_check >/dev/null 2>&1; expect \$DISPLAY_KV_MIB 1792"
+case_ "display explicit: never probed, never turned off (the engine refuses instead)" 0 "DISPLAY_KV_MIB=1792 PORT_DISPLAY_EXPLICIT=1" "$expect; $dstubs
+  display_probe() { echo 'CONNECTED card0-DP-1'; }; worker() { echo 'CONNECTED card0-DP-1'; }
+  port_display_check >/dev/null 2>&1; expect \$DISPLAY_KV_MIB 1792
+  port_display_load_failed 'error: DisplayShort' && exit 1; exit 0"
+case_ "display default: a reserve the engine cannot map at load restarts once without it" 0 "DISPLAY_KV_MIB=1792 PORT_DISPLAY_EXPLICIT=0" "
+  port_display_load_failed 'dsv41: error.DisplayShort: the framebuffer reservation is smaller' || exit 1
+  port_display_load_failed 'rank 1: DisplayCreateDumb' || exit 1
+  port_display_load_failed 'error: OutOfMemory' && exit 1
+  PORT_DISPLAY_WHY=DisplayShort port_display_load_failed 'DisplayShort' && exit 1   # never twice
+  DISPLAY_KV_MIB=0; port_display_load_failed 'DisplayShort' && exit 1; exit 0"
+check_ "display default: start.sh retries once, without the reserve, as a restart" '
+  src=$(cat "$here/../start.sh")
+  [[ "$src" == *"running_here && running_worker 1 || display_retry \"\$@\""* ]] || { echo "the load loop does not call display_retry"; exit 1; }
+  d=$(grep -n "^display_retry() {" "$here/../start.sh" | cut -d: -f1); f=$(grep -n "|| foreground \"\$@\"$" "$here/../start.sh" | cut -d: -f1)
+  [[ -n "$d" && -n "$f" ]] && (( d < f )) || { echo "FOREGROUND=1 runs foreground before display_retry is defined (or without the arguments)"; exit 1; }
+  [[ "$src" == *"exec env DISPLAY_KV_MIB=0 PORT_DISPLAY_WHY=\"\$why\" \"\$BASH\" \"\$0\" restart \"\$@\""* ]] || { echo "no restart without the reserve"; exit 1; }
+  grep -q "^port_display_check" "$here/../start.sh" || { echo "start.sh does not check the display before anything is stopped"; exit 1; }'
+# FOREGROUND=1 (docs/systemd.md): a rank that could not map the default reserve gets the same single retry without it
+# (exec: the supervisor's main process goes on), and any other exit, a broken pair's 75 included, is still rank 0's code
+check_ "display default: FOREGROUND=1 retries once without the reserve too; other exits keep rank 0's code" '
+  t=$(mktemp -d "${TMPDIR:-/tmp}/port-test.XXXXXX"); trap "rm -rf -- \"$t\"" EXIT
+  fns="/^display_retry() {/,/^}/p; /^foreground() {/,/^}/p"   # a variable: bash 3.2 brace-expands inside "$(...)"
+  eval "$(sed -n "$fns" "$here/../start.sh")"
+  docker() { case "$1" in logs) [[ "$2" == -f ]] || cat "$t/log";; inspect) cat "$t/code";; esac; return 0; }
+  worker() { return 0; }; running_here() { return 1; }; running_worker() { return 0; }; warn() { echo "warn: $*"; }
+  port_display_load_failed() { grep -q DisplayShort <<<"$1"; }
+  PORT_DISPLAY_ERRORS=DisplayShort; CONTAINER_NAME=c
+  printf "#!/bin/sh\necho \"exec DISPLAY_KV_MIB=\$DISPLAY_KV_MIB WHY=\$PORT_DISPLAY_WHY \$*\"\n" > "$t/bash"; chmod +x "$t/bash"; BASH=$t/bash
+  echo "dsv41: error.DisplayShort" > "$t/log"; echo 1 > "$t/code"
+  ( foreground --x ) > "$t/out" 2>&1 < /dev/null
+  grep -q "^exec DISPLAY_KV_MIB=0 WHY=DisplayShort .* restart --x$" "$t/out" || { echo "no restart without the reserve:"; cat "$t/out"; exit 1; }
+  : > "$t/log"; echo 75 > "$t/code"
+  ( foreground --x ) > "$t/out" 2>&1 < /dev/null; rc=$?
+  [[ "$rc" == 75 ]] && ! grep -q "^exec" "$t/out" || { echo "a broken pair did not exit 75 (exit $rc):"; cat "$t/out"; exit 1; }'
 # start.sh / stop.sh: a container left over, an exited one too (rank 0 after a broken pair's status 75), goes through
 # stop.sh before a launch removes it, and stop.sh saves each rank's log before its docker rm: a restart keeps the evidence
 check_ "start.sh: a container left over, running or exited, is stopped by stop.sh (its log saved) before the launch" '
@@ -562,10 +618,13 @@ EOF
   chmod +x "$G_T/bin/"*
   # grun <tree> <out> [NAME=value...]: the tree's start.sh, DRY_RUN=1, the live serving settings; its two ranks'
   # docker commands (the lines after "[dry-run] rank ...") into <out>
+  # Robert's fork turns the display reserve on by default: the port tree's runs set DISPLAY_KV_MIB=0 unless GRUN_RAW=1
+  # (the defaults' own runs), so the other cases compare like with like
   grun() {
-    local tree=$1 out=$2; shift 2
+    local tree=$1 out=$2 extra=(); shift 2
+    [[ "$tree" != port || -n "${GRUN_RAW:-}" ]] || extra=(DISPLAY_KV_MIB=0)
     env -i PATH="$G_T/bin:$PATH" HOME="$G_T/home" WORKER=u@10.9.0.2 DRY_RUN=1 PREPARE=0 IMAGE=tensorfold-dsv41:golden \
-      HF_CACHE="$G_T/home/hf" STATE_DIR="$G_T/state" LOG_DIR="$G_T/logs" CONTEXT=1048576 PARALLEL=8 ROUND_ROWS=16 "$@" \
+      HF_CACHE="$G_T/home/hf" STATE_DIR="$G_T/state" LOG_DIR="$G_T/logs" CONTEXT=1048576 PARALLEL=8 ROUND_ROWS=16 ${extra[@]+"${extra[@]}"} "$@" \
       "$b4" "$G_T/$tree/start.sh" > "$G_T/$out.log" 2>&1 || { echo "start.sh ($tree) failed:"; tail -5 "$G_T/$out.log"; return 1; }
     awk 'p { print; p = 0 } /^\[dry-run\] rank [01] / { p = 1 }' "$G_T/$out.log" > "$G_T/$out"
     [[ "$(wc -l < "$G_T/$out" | tr -d ' ')" == 2 ]] || { echo "start.sh ($tree) printed no two docker commands:"; tail -5 "$G_T/$out.log"; return 1; }
@@ -607,12 +666,14 @@ EOF
       diff "$G_T/off.out" "$G_T/def.out"'
   else
     check_ "golden: a fork's defaults = SPILL_GIB=$gdef_gib KV_SHARD=$gdef_shard given explicitly (SPILL_GIB=0 where the folder fails here)" '
-      grun port def.out || exit 1
+      GRUN_RAW=1 grun port def.out || exit 1
       if grep -q "SPILL TIER OFF" "$G_T/def.out.log"; then echo "(the default spill folder fails here: compared with SPILL_GIB=0)"; s=0; else s=$gdef_gib; fi
-      grun port exp.out SPILL_GIB=$s KV_SHARD=$gdef_shard ${GDEF_EXTRA:-} || exit 1
+      d=$(sed -n "s/^PORT_DISPLAY_DEFAULT_MIB=\([0-9]*\).*/\1/p" "$groot/scripts/config.sh"); d=${d:-0}
+      if grep -q "DISPLAY RESERVE OFF" "$G_T/def.out.log"; then echo "(the default display reserve is off here: compared with DISPLAY_KV_MIB=0)"; d=0; fi
+      grun port exp.out SPILL_GIB=$s KV_SHARD=$gdef_shard DISPLAY_KV_MIB=$d || exit 1
       diff "$G_T/exp.out" "$G_T/def.out"'
     check_ "golden: a fork's default spill tier whose folder fails starts without it" '
-      grun port deg.out SPILL_FLOOR_GIB=999999 || exit 1
+      GRUN_RAW=1 grun port deg.out SPILL_FLOOR_GIB=999999 || exit 1
       grep -q "WARN: SPILL TIER OFF for this start" "$G_T/deg.out.log" || { tail -5 "$G_T/deg.out.log"; exit 1; }
       ! grep -qE -- "--spill-dir|tf\.recipe\.spill|TF_DS_SPILL" "$G_T/deg.out" || { echo "spill left in the commands"; exit 1; }'
   fi

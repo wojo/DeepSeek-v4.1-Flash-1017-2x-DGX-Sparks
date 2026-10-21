@@ -1,8 +1,8 @@
 # Deploying the port fork on gx10-a
 
 How the fork checkout that serves Robert's traffic is brought to a newer `main` (this branch, with the engine as the
-patch series `zig/patches/0011-...` to `0022-...`), and how it is rolled back. GPU work and anything on the
-Sparks is the coordinator's: these are the steps it runs. Nothing here changes the stock checkout.
+patch series `zig/patches/0011-...` to `0022-...` and this fork's defaults on), and how it is rolled back. GPU work
+and anything on the Sparks is the coordinator's: these are the steps it runs. Nothing here changes the stock checkout.
 
 ## What serves now
 
@@ -61,9 +61,10 @@ stays whole for a rollback.
    ```
 
    Only one copy of the port may be in `zig/patches` (an older `0007-...` or `0011-spill-kvshard.patch` export and the
-   series touch the same files and would not apply together). The features are **off** by default in this branch, so the
-   fork's `scripts/local.sh` turns them on: `SPILL_GIB=64 KV_SHARD=1` (an empty `POOL` is derived from
-   `CONTEXT=1048576`: 2,101,248), or a larger `POOL`. Set there, a bad spill folder refuses the start. Each Spark's
+   series touch the same files and would not apply together). This branch turns spill v2, KV sharding and the display
+   reserve on by default (`SPILL_GIB=64`, `KV_SHARD=1`, `DISPLAY_KV_MIB=1792`, an empty `POOL` derived as 5,218,304,
+   or 2,101,248 without the reserve), each left out of a start it cannot run in, with a warning; `scripts/local.sh`
+   needs no feature lines, and one set there refuses the start instead (a bad spill folder, say). Each Spark's
    `SPILL_DIR` / `WORKER_SPILL_DIR` must be on its own NVMe (docs/PORT-RECIPE.md).
 
 4. **Test the new tree on gx10-a, then look before switching.** The Mac has only bash 3.2, so `scripts/port_test.sh`
@@ -144,9 +145,9 @@ the pair itself.
 
 Hold first (`touch ~/.deepseek1017-hold`), remove it at the end.
 
-- **A feature off, same image:** set it off in `~/DeepSeek-port/scripts/local.sh` (`SPILL_GIB=0`, `KV_SHARD=0`,
-  `POOL=`), `sudo systemctl restart deepseek1017.service`. With `SPILL_GIB=0 KV_SHARD=0` (or the lines removed, the
-  defaults being off) this is the port image with the port unused.
+- **A feature off, same image:** set it off explicitly in `~/DeepSeek-port/scripts/local.sh` (`SPILL_GIB=0`,
+  `KV_SHARD=0`, `DISPLAY_KV_MIB=0`, `POOL=`), `sudo systemctl restart deepseek1017.service`. With all three at `0` this
+  is the port image with the port unused; removing the lines turns this fork's defaults back on.
 - **The previous fork, exactly:** swap the folders back and restart. Its image is still on both Sparks (and tagged
   `fork-rollback`), so `prepare.sh` finds it and rebuilds nothing:
 
@@ -157,7 +158,7 @@ Hold first (`touch ~/.deepseek1017-hold`), remove it at the end.
 
   `source scripts/config.sh; echo $IMAGE` in the restored tree must print the tag in `$d/image`.
 - **The previous image from the new tree** (quickest, no folder swap): in `scripts/local.sh` set every port setting
-  off explicitly (`SPILL_GIB=0 KV_SHARD=0`: an image without the port refuses the spill flags)
+  off explicitly (`SPILL_GIB=0 KV_SHARD=0 DISPLAY_KV_MIB=0`: an image without the port refuses the spill flags)
   plus `IMAGE=<the tag in $d/image>` and `PREPARE=0`, restart the unit. `PREPARE=0` keeps `prepare.sh` from
   rebuilding under that tag; never combine an old `IMAGE` with `PREPARE=1` or `auto`. Take both lines out again after.
 - **Back to the stock server:** `sudo rm /etc/systemd/system/deepseek1017.service.d/fork.conf && sudo systemctl

@@ -150,11 +150,17 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
 # Display-reserve KV (ezoushen's PR #9, zig/patches/0024-display-kv): the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb buffer on
 # DISPLAY_KV_CARD mapped into the GPU's address space), so their bytes leave the host's MemAvailable. MiB of it to use, whole steps
-# of 16, at most 2032; the tensors that fit go there (with KV_SHARD=1 this Spark's owner planes first), the rest stay on ordinary memory. 0 (default): off. It needs no display
+# of 16, at most 2032; the tensors that fit go there (with KV_SHARD=1 this Spark's owner planes first), the rest stay on ordinary memory. 0: off. It needs no display
 # connected to the card (the engine checks); both ranks take it. TF_DS_DISPLAY_KV_MIB and TF_DS_DISPLAY_KV_CARD. The containers get the one
 # card node, read-write without mknod (--device CARD:CARD:rw), and use three DRM ioctls on it (MODE_CREATE_DUMB, MODE_MAP_DUMB, GEM_CLOSE)
 # plus an mmap of the buffer: none needs DRM master or CAP_SYS_ADMIN (see README, Memory and safety). DISPLAY_KV_CARD must look like /dev/dri/card0.
-DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-0}"
+# Robert's fork: on by default at 1792 MiB (PORT_DISPLAY_DEFAULT_MIB). Left at the default, a card with a connected display on either
+# Spark, a missing card or a reserve the engine cannot map turns it off for that start with a warning (scripts/port.sh,
+# port_display_check; start.sh restarts once without it), and an empty POOL is then the 2,101,248 sharded default; set
+# explicitly (DISPLAY_KV_MIB or TF_DS_DISPLAY_KV_MIB), the engine refuses those instead.
+PORT_DISPLAY_DEFAULT_MIB=1792
+PORT_DISPLAY_EXPLICIT=0; [[ -z "${DISPLAY_KV_MIB:-}${TF_DS_DISPLAY_KV_MIB:-}" ]] || PORT_DISPLAY_EXPLICIT=1
+DISPLAY_KV_MIB="${DISPLAY_KV_MIB:-${TF_DS_DISPLAY_KV_MIB:-$PORT_DISPLAY_DEFAULT_MIB}}"
 DISPLAY_KV_CARD="${DISPLAY_KV_CARD:-/dev/dri/card0}"
 
 # ---------------------------------------------------------------- files
@@ -217,7 +223,7 @@ MEMGUARD_GIB="${MEMGUARD_GIB:-2.5}"
 MEMGUARD_HOLD_S="${MEMGUARD_HOLD_S:-4}"
 MEMGUARD_HARD_GIB="${MEMGUARD_HARD_GIB:-1}"
 
-# ---------------------------------------------------------------- the ported features (off by default: spill v2, KV sharding)
+# ---------------------------------------------------------------- the ported features (spill v2, KV sharding; on by default in this fork)
 # Spill v2 (SPILL_GIB, SPILL_DIR, WORKER_SPILL_DIR, SPILL_FLOOR_GIB, SPILL_QUOTA_GIB), KV sharding (KV_SHARD,
 # KV_SHARD_DECODE; it builds on POOL above): defaults, checks and their mapping to the engine's flags and variables in
 # scripts/port.sh (docs/PORT-RECIPE.md).

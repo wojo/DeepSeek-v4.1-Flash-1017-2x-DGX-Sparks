@@ -14,11 +14,17 @@ every configuration; disk restores after eviction, a restart and damaged files).
 host tests; its GPU checks are listed in `tools/PORT-VALIDATION.md`. Disk numbers on this page are calculated from
 the engine's layout unless marked measured.
 
-**Everything is off by default** (`PORT_SPILL_DEFAULT_GIB=0`, `PORT_SHARD_DEFAULT=0` in `scripts/port.sh`; `POOL`
-empty): the recipe and the engine run as before the port, but for one change that acts only after a failure: a broken
-rank pair ends rank 0 with status 75 instead of hanging it ([below](#when-the-rank-pair-breaks-status-75)). Turn the
-features on in `scripts/local.sh`; `SPILL_GIB=64 KV_SHARD=1` (with `POOL` empty, derived from `CONTEXT`: 2,101,248 at
-`CONTEXT=1048576` and 16-row rounds) is what the pair was validated with.
+**This fork (Robert's `main`) turns the defaults on:** `PORT_SPILL_DEFAULT_GIB=64`, `PORT_SHARD_DEFAULT=1`
+(`scripts/port.sh`) and `PORT_DISPLAY_DEFAULT_MIB=1792` (`scripts/config.sh`, ezoushen's display reserve), with an
+empty `POOL` derived as 5,218,304 while the reserve is on (`port_display_pool`: the owner planes fill it) and 2,101,248
+when it is off. A default degrades (below); the display reserve's own checks are `port_display_check` (a connected
+display or no card on either Spark, before anything is stopped) and a single restart without it when the engine
+cannot map it at load (`port_display_load_failed`, e.g. `DisplayShort`). The upstream branch keeps **everything off by
+default** (`PORT_SPILL_DEFAULT_GIB=0`, `PORT_SHARD_DEFAULT=0`; `POOL` empty): the recipe and the engine run as before
+the port. In both, one change acts only after a failure: a broken rank pair ends rank 0 with status 75 instead of
+hanging it ([below](#when-the-rank-pair-breaks-status-75)). Turn the features on in `scripts/local.sh`; `SPILL_GIB=64
+KV_SHARD=1` (with `POOL` empty, derived from `CONTEXT`: 2,101,248 at `CONTEXT=1048576` and 16-row rounds) is what the
+pair was validated with.
 
 | To turn on | Set | Then |
 | --- | --- | --- |

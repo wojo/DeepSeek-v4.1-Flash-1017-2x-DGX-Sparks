@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Robert's defaults (this fork's `main` only):** `SPILL_GIB=64`, `KV_SHARD=1` and the display reserve at
+  `DISPLAY_KV_MIB=1792` on by default, an empty `POOL` derived as 5,218,304 with the reserve (2,101,248 without). Every
+  default degrades: a failing spill folder, a connected display or missing card on either Spark (checked before anything
+  is stopped), or a reserve the engine cannot map at load (one restart without it) starts without that feature, with a
+  warning; explicit settings still refuse.
+
 - Display-reserve KV, `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only), by **ezoushen**
   ([pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9), its patch `0007-display-kv` ported as
   `zig/patches/0024-display-kv.patch`): the KV caches on the framebuffer the UEFI reserves, so their bytes leave the host's `MemAvailable`
