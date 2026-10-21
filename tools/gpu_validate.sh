@@ -295,7 +295,8 @@ port_env() {   # the environment start.sh / stop.sh / tools get for the port che
   [[ -f "$PORT_STATE_DIR/api-key" ]] && key="API_KEY_FILE=$PORT_STATE_DIR/api-key"
   # its own LOG_DIR here, and LOG_KEEP high enough that its stops never rotate out the daily's logs on the worker
   # (stop.sh saves rank 1's log in the worker's fixed ~/.cache/dsv41-tensorfold/logs, keeping the newest LOG_KEEP)
-  echo "STATE_DIR=$PORT_STATE_DIR LOG_DIR=$PORT_LOG_DIR LOG_KEEP=1000 $key"
+  # DISPLAY_KV_MIB=0: Robert's fork turns the display reserve on by default; a configuration that tests it sets it in its words
+  echo "STATE_DIR=$PORT_STATE_DIR LOG_DIR=$PORT_LOG_DIR LOG_KEEP=1000 DISPLAY_KV_MIB=0 $key"
 }
 # port_running: a container named CONTAINER that the PORT's start.sh made (it labels tf.recipe.port, "off" included;
 # the daily recipe's containers carry no such label), here or on the worker
