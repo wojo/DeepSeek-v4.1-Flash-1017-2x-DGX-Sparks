@@ -1,0 +1,873 @@
+# dsv41: display-reserve KV, E-Zou Shen's (ezoushen) patch 0007-display-kv from
+# MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks#9, ported onto 0008's pool and window and the port's KV sharding.
+# With TF_DS_DISPLAY_KV_MIB (whole 16 MiB steps up to 2032; unset or 0 is off and changes nothing) the KV caches go on
+# the framebuffer a headless GB10 reserves at boot (UEFI, about 1.75 GiB a GPU), through a DRM dumb buffer on
+# TF_DS_DISPLAY_KV_CARD (default /dev/dri/card0; refused when an output is connected) mapped above host pages in one
+# cuMemHostRegister'd span, so those bytes leave the host's MemAvailable. The tensors that fit go there, the rest stay
+# on host pages; every tensor lies wholly on one half of the span.
+# - display.zig is #9's as written (a port of the DRM-framebuffer backend of the TensorFold GLM engine,
+#   glm_cuda/cuda_display_kv.zig, by the TensorFold contributors). Caches.layout and Model.makeCaches are ported by
+#   hand: with TF_DS_KV_SHARD=1 the layout takes this rank's owner planes (its part's compressed codes and scales) last,
+#   after every layer's index keys and raw stores, so the framebuffer fills with the owner planes first; replicated,
+#   the order is the arena's, as #9 places it. Each rank logs at start how many MiB went to the reserve (and of its
+#   owner planes) and how many to normal memory.
+# - RoPE: a stream's positions are its own (from 0 at its extent's base), so the tables need an extent plus a round's
+#   rows (0008's ropeRows), never the pool or a part. A window the kit's tables (1,114,112 positions) do not cover is
+#   now refused at start with the table size and the longest window that fits, instead of a bare ShortRopeTable.
+# Recipe settings DISPLAY_KV_MIB and DISPLAY_KV_CARD (both ranks; start.sh also gives the containers the card node).
+# Measured in #9 on the stock recipe (replicated KV, 893 MiB a rank, all of it on the framebuffer): the head's idle
+# MemAvailable from 6.76 to 7.49 GiB, its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB; tools/exact.py
+# 31 of 31 identical with it on and off. Measured on this pair with the port's sharded pool, at POOL=5218304 and
+# DISPLAY_KV_MIB=1792: 1,791 MiB a rank on the reserve (all of its owner planes), 852 MiB in normal memory; exact.py
+# 39 of 39 identical; the lowest MemAvailable during a 227,640-token prompt 6.57 / 8.32 GiB, against 6.44 / 8.22 GiB
+# for 2,101,248 positions without the reserve.
+# Applies after 0023 (engine port/series-display-kv-pair-370daf0: one commit on port/series-pair-370daf0).
+# display.zig by E-Zou Shen (@ezoushen); its wiring onto the pool and window and KV sharding by Robert Wojciechowski
+# (GitHub @wojo, X @rwojo). Apache-2.0.
+diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig
+index 97e048c99450c4bdfe699e83627ee4f1da959948..71c88f06c76d46c1e97c85c6e0716a6e9a8921b6 100644
+--- a/zig/src/cuda/abi.zig
++++ b/zig/src/cuda/abi.zig
+@@ -156,6 +156,8 @@ pub const Api = struct {
+     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
+     cuMemHostAlloc: *const fn (*Ptr, usize, c_uint) callconv(.c) R,
+     cuMemHostGetDevicePointer_v2: *const fn (*DevicePtr, Ptr, c_uint) callconv(.c) R,
++    cuMemHostRegister_v2: *const fn (Ptr, usize, c_uint) callconv(.c) R,
++    cuMemHostUnregister: *const fn (Ptr) callconv(.c) R,
+     cuMemFreeHost: *const fn (Ptr) callconv(.c) R,
+     cuMemcpyHtoD_v2: *const fn (DevicePtr, CPtr, usize) callconv(.c) R,
+     cuMemcpyDtoH_v2: *const fn (Ptr, DevicePtr, usize) callconv(.c) R,
+diff --git a/zig/src/families/dsv41/display.zig b/zig/src/families/dsv41/display.zig
+new file mode 100644
+index 0000000000000000000000000000000000000000..dec3262bf5fbaa86c1d5f75a728ca085dac62ec5
+--- /dev/null
++++ b/zig/src/families/dsv41/display.zig
+@@ -0,0 +1,463 @@
++//! Display-reserve KV (TF_DS_DISPLAY_KV_MIB): the headless GB10's UEFI framebuffer reservation (about 1.75 GiB a GPU) carries part of the
++//! device KV pool, so those bytes leave the host's MemAvailable. Ported from MiaAI-Lab's TensorFold GLM engine (glm_cuda/cuda_display_kv.zig,
++//! TensorFold by Ash Hart and contributors), DRM backend only: a DRM dumb buffer mapped above the ordinary half of one span, each half
++//! registered with cuMemHostRegister, one contiguous device range. Every tensor lies wholly on one half, so no copy or fill ever has to cross
++//! the driver's registration boundary.
++const std = @import("std");
++const cuda = @import("cuda");
++
++fn env(name: [:0]const u8) ?[]const u8 {
++    return if (std.c.getenv(name)) |v| std.mem.span(v) else null;
++}
++
++/// MiB of the framebuffer to use: whole 16 MiB steps, at most 2032 (the reservation is 2 GiB less the driver's tail); unset or blank is 0 (off).
++pub fn mib(raw: ?[]const u8) !usize {
++    const t = std.mem.trim(u8, raw orelse "", " \t\r\n");
++    if (t.len == 0) return 0;
++    const n = std.fmt.parseInt(i64, t, 10) catch return error.InvalidDisplayMiB;
++    if (n < 0 or n > 2032 or @mod(n, 16) != 0) return error.InvalidDisplayMiB;
++    return @intCast(n);
++}
++
++pub const Config = struct {
++    bytes: usize = 0,
++    card: []const u8 = "/dev/dri/card0",
++
++    pub fn parse(size: ?[]const u8, card: ?[]const u8) !Config {
++        return .{ .bytes = (try mib(size)) << 20, .card = card orelse "/dev/dri/card0" };
++    }
++
++    /// TF_DS_DISPLAY_KV_MIB and TF_DS_DISPLAY_KV_CARD.
++    pub fn read() !Config {
++        return parse(env("TF_DS_DISPLAY_KV_MIB"), env("TF_DS_DISPLAY_KV_CARD"));
++    }
++};
++
++/// The framebuffer is only free to borrow with no display attached: any connected output on the card refuses.
++pub fn headless(gpa: std.mem.Allocator, io: std.Io, sysfs: []const u8, card_path: []const u8) !void {
++    var dir = try std.Io.Dir.cwd().openDir(io, sysfs, .{ .iterate = true });
++    defer dir.close(io);
++    const prefix = try std.fmt.allocPrint(gpa, "{s}-", .{std.fs.path.basename(card_path)});
++    defer gpa.free(prefix);
++    var it = dir.iterate();
++    while (try it.next(io)) |entry| {
++        if (!std.mem.startsWith(u8, entry.name, prefix)) continue;
++        const path = try std.fmt.allocPrint(gpa, "{s}/status", .{entry.name});
++        defer gpa.free(path);
++        var f = try dir.openFile(io, path, .{});
++        defer f.close(io);
++        var buf: [128]u8 = undefined;
++        var r = f.readerStreaming(io, &buf);
++        const text = try r.interface.allocRemaining(gpa, .limited(128));
++        defer gpa.free(text);
++        if (std.mem.eql(u8, std.mem.trim(u8, text, " \t\r\n"), "connected")) return error.DisplayConnected;
++    }
++}
++
++/// The kernel's page (GB10's arm64 kernel runs 64 KiB pages): the display half of the span is mapped at a page boundary.
++pub const page: usize = 64 << 10;
++/// Device pointers the kernels get are 256-byte aligned, as cuMemAlloc hands them out.
++const buffer_align: usize = 256;
++
++/// How one span holds every tensor: `ordinary` bytes of host pages then `display` bytes on the framebuffer (both whole 64 KiB pages).
++pub const Plan = struct { total: usize, ordinary: usize, display: usize };
++
++/// Packs `sizes` into offsets `offs[i]` of one span, 256-byte aligned and in order, and puts the last tensors, as many as fit in `budget` bytes
++/// of the framebuffer, on its top half. A tensor never straddles the two halves (the driver refuses a copy or a memset across two
++/// cuMemHostRegister ranges), so the boundary falls between two tensors, at a page; the tensors above it are shifted up to it.
++pub fn place(offs: []usize, sizes: []const usize, budget: usize) !Plan {
++    std.debug.assert(offs.len == sizes.len);
++    var at: usize = 0;
++    for (sizes, offs) |n, *o| {
++        o.* = at;
++        at = std.math.add(usize, at, std.mem.alignForward(usize, n, buffer_align)) catch return error.DisplayTooLarge;
++    }
++    // the first tensor on the framebuffer: the tail whose bytes fit in the budget less a page (the boundary's rounding up to a page takes
++    // at most that much of it back)
++    const room = budget -| page;
++    var first = sizes.len;
++    var shown: usize = 0;
++    while (first > 0) {
++        const n = std.mem.alignForward(usize, sizes[first - 1], buffer_align);
++        if (shown + n > room) break;
++        shown += n;
++        first -= 1;
++    }
++    if (first == sizes.len) return .{ .total = std.mem.alignForward(usize, at, page), .ordinary = std.mem.alignForward(usize, at, page), .display = 0 };
++    const start = offs[first];
++    const boundary = std.mem.alignForward(usize, start, page);
++    for (offs[first..]) |*o| o.* = o.* - start + boundary;
++    const total = std.mem.alignForward(usize, boundary + shown, page);
++    return .{ .total = total, .ordinary = boundary, .display = total - boundary };
++}
++
++/// What a placement put where, in tensor bytes (no alignment padding): every tensor, those on the framebuffer half and
++/// those on host pages, and of the tensors from `owner_from` on (TF_DS_KV_SHARD's owner planes, layout's last ones)
++/// all and those on the framebuffer. For the start-up's note.
++pub const Split = struct { total: usize = 0, display: usize = 0, ordinary: usize = 0, owner: usize = 0, owner_display: usize = 0 };
++
++pub fn split(offs: []const usize, sizes: []const usize, p: Plan, owner_from: usize) Split {
++    std.debug.assert(offs.len == sizes.len and owner_from <= sizes.len);
++    var s: Split = .{};
++    for (offs, sizes, 0..) |o, n, i| {
++        const shown = p.display > 0 and o >= p.ordinary;
++        s.total += n;
++        if (shown) s.display += n else s.ordinary += n;
++        if (i >= owner_from) {
++            s.owner += n;
++            if (shown) s.owner_display += n;
++        }
++    }
++    return s;
++}
++
++extern "c" fn mmap(?*anyopaque, usize, c_int, c_int, c_int, i64) ?*anyopaque;
++extern "c" fn munmap(?*anyopaque, usize) c_int;
++extern "c" fn ioctl(c_int, c_ulong, ...) c_int;
++extern "c" fn open([*:0]const u8, c_int, ...) c_int;
++
++/// One mapped span: ordinary host pages below, the framebuffer's dumb buffer above, each its own cuMemHostRegister range, one contiguous
++/// device range from `ptr`.
++pub const Span = struct {
++    /// the device address of the span's first byte
++    ptr: u64,
++    base: usize = 0,
++    ordinary: usize = 0,
++    display: usize = 0,
++    fd: c_int = -1,
++    handle: u32 = 0,
++    ordinary_registered: bool = false,
++    display_registered: bool = false,
++    d: *const cuda.Driver,
++    /// set by map(): this span holds the process's one framebuffer claim
++    owns_claim: bool = false,
++
++    pub fn deinit(s: *Span) void {
++        defer if (s.owns_claim) {
++            releaseClaim();
++            s.owns_claim = false;
++        };
++        if (s.base == 0) return;
++        if (s.display_registered) _ = s.d.api.cuMemHostUnregister(@ptrFromInt(s.base + s.ordinary));
++        if (s.ordinary_registered) _ = s.d.api.cuMemHostUnregister(@ptrFromInt(s.base));
++        _ = munmap(@ptrFromInt(s.base), s.ordinary + s.display);
++        var close_gem = [_]u32{ s.handle, 0 };
++        _ = ioctl(s.fd, 0x40086409, &close_gem); // DRM_IOCTL_GEM_CLOSE
++        _ = std.c.close(s.fd);
++        s.base = 0;
++    }
++};
++
++fn mapped(address: usize, size: usize, prot: c_int, flags: c_int, fd: c_int, offset: u64) !usize {
++    const p = mmap(if (address == 0) null else @ptrFromInt(address), size, prot, flags, fd, @intCast(offset)) orelse return error.DisplayMmap;
++    const at = @intFromPtr(p);
++    if (at == std.math.maxInt(usize) or (address != 0 and at != address)) return error.DisplayMmap;
++    return at;
++}
++
++var claimed: std.atomic.Value(bool) = .init(false);
++
++fn tryClaim() bool {
++    return claimed.cmpxchgStrong(false, true, .acq_rel, .acquire) == null;
++}
++
++fn releaseClaim() void {
++    claimed.store(false, .release);
++}
++
++/// Maps the plan's ordinary host pages and its framebuffer bytes as one registered span. One framebuffer a process.
++pub fn map(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, card_path: []const u8, p: Plan) !Span {
++    if (!tryClaim()) return error.DisplayAlreadyAllocated;
++    errdefer releaseClaim();
++    try headless(gpa, io, "/sys/class/drm", card_path);
++    const card = try gpa.dupeSentinel(u8, card_path, 0);
++    defer gpa.free(card);
++    var system: System = .{ .d = d, .card = card };
++    var span = try mapDrm(&system, p.ordinary, p.display);
++    span.owns_claim = true;
++    return span;
++}
++
++/// The real OS and driver calls (DRM_IOCTL_MODE_CREATE_DUMB 0xC02064B2, MODE_MAP_DUMB 0xC01064B3, GEM_CLOSE 0x40086409;
++/// cuMemHostRegister flags 2 = DEVICEMAP, 6 = DEVICEMAP | IOMEMORY).
++const System = struct {
++    d: *const cuda.Driver,
++    card: [:0]const u8,
++    fn openCard(s: *System) !c_int {
++        const fd = open(s.card, 2 | 0x80000); // O_RDWR | O_CLOEXEC
++        if (fd < 0) return error.DisplayCardUnavailable;
++        return fd;
++    }
++    fn create(_: *System, fd: c_int, size: usize) !struct { handle: u32, size: usize } {
++        var dumb: extern struct { height: u32, width: u32 = 4096, bpp: u32 = 32, flags: u32 = 0, handle: u32 = 0, pitch: u32 = 0, size: u64 = 0 } = .{ .height = @intCast(std.math.divCeil(usize, size, 4096 * 4) catch return error.DisplayCreateDumb) };
++        if (ioctl(fd, 0xC02064B2, &dumb) != 0) return error.DisplayCreateDumb;
++        return .{ .handle = dumb.handle, .size = @intCast(dumb.size) };
++    }
++    fn offset(_: *System, fd: c_int, handle: u32) !u64 {
++        var out: extern struct { handle: u32, pad: u32 = 0, offset: u64 = 0 } = .{ .handle = handle };
++        if (ioctl(fd, 0xC01064B3, &out) != 0) return error.DisplayMapDumb;
++        return out.offset;
++    }
++    fn reserve(_: *System, size: usize) !usize {
++        return mapped(0, size, 0, 0x4022, -1, 0); // PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE
++    }
++    fn ordinary(_: *System, base: usize, size: usize) !void {
++        _ = try mapped(base, size, 3, 0x32, -1, 0); // RW, MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
++    }
++    fn display(_: *System, base: usize, size: usize, fd: c_int, offset_value: u64) !void {
++        _ = try mapped(base, size, 3, 0x11, fd, offset_value); // RW, MAP_SHARED | MAP_FIXED
++    }
++    fn register(s: *System, base: usize, size: usize, is_io: bool) !void {
++        try s.d.check(s.d.api.cuMemHostRegister_v2(@ptrFromInt(base), size, if (is_io) 6 else 2), "display register");
++    }
++    fn pointer(s: *System, base: usize) !u64 {
++        var out: u64 = 0;
++        try s.d.check(s.d.api.cuMemHostGetDevicePointer_v2(&out, @ptrFromInt(base), 0), "display device pointer");
++        return out;
++    }
++    fn unregister(s: *System, base: usize) void {
++        _ = s.d.api.cuMemHostUnregister(@ptrFromInt(base));
++    }
++    fn unmap(_: *System, base: usize, size: usize) void {
++        _ = munmap(@ptrFromInt(base), size);
++    }
++    fn closeGem(_: *System, fd: c_int, handle: u32) void {
++        var gem = [_]u32{ handle, 0 };
++        _ = ioctl(fd, 0x40086409, &gem);
++    }
++    fn closeFd(_: *System, fd: c_int) void {
++        _ = std.c.close(fd);
++    }
++};
++
++/// The call seam the tests drive: every failure unwinds what the steps before it made.
++fn mapDrm(system: anytype, ordinary: usize, display_bytes: usize) !Span {
++    const fd = try system.openCard();
++    errdefer system.closeFd(fd);
++    const dumb = try system.create(fd, display_bytes);
++    errdefer system.closeGem(fd, dumb.handle);
++    if (dumb.size < display_bytes) return error.DisplayShort;
++    const offset = try system.offset(fd, dumb.handle);
++    const base = try system.reserve(ordinary + display_bytes);
++    errdefer system.unmap(base, ordinary + display_bytes);
++    if (ordinary > 0) try system.ordinary(base, ordinary);
++    try system.display(base + ordinary, display_bytes, fd, offset);
++    if (ordinary > 0) try system.register(base, ordinary, false);
++    errdefer if (ordinary > 0) system.unregister(base);
++    try system.register(base + ordinary, display_bytes, true);
++    errdefer system.unregister(base + ordinary);
++    const ptr = try system.pointer(base);
++    const top = try system.pointer(base + ordinary);
++    if (top < ptr or top - ptr != ordinary) return error.DisplayNotContiguous;
++    return .{ .ptr = ptr, .base = base, .ordinary = ordinary, .display = display_bytes, .fd = fd, .handle = dumb.handle, .d = system.d, .ordinary_registered = ordinary > 0, .display_registered = true };
++}
++
++test "display configuration: whole 16 MiB steps from 0 to 2032, anything else refused" {
++    try std.testing.expectEqual(@as(usize, 0), try mib(null));
++    try std.testing.expectEqual(@as(usize, 0), try mib("  "));
++    try std.testing.expectEqual(@as(usize, 1792), try mib(" 1792 "));
++    try std.testing.expectEqual(@as(usize, 2032), try mib("2032"));
++    for ([_][]const u8{ "-16", "1", "2048", "2033", "nan", "16.0", "0x10" }) |raw| try std.testing.expectError(error.InvalidDisplayMiB, mib(raw));
++}
++
++test "display config: unset is off with the default card, a size sets the bytes, a card path is kept" {
++    const off = try Config.parse(null, null);
++    try std.testing.expectEqual(@as(usize, 0), off.bytes);
++    try std.testing.expectEqualStrings("/dev/dri/card0", off.card);
++    const on = try Config.parse("1792", "/dev/dri/card1");
++    try std.testing.expectEqual(@as(usize, 1792 << 20), on.bytes);
++    try std.testing.expectEqualStrings("/dev/dri/card1", on.card);
++    try std.testing.expectError(error.InvalidDisplayMiB, Config.parse("1793", null));
++}
++
++test "a connected output on the configured card refuses display memory" {
++    var tmp = std.testing.tmpDir(.{});
++    defer tmp.cleanup();
++    const io = std.testing.io;
++    try tmp.dir.createDir(io, "card0-HDMI-A-1", .default_dir);
++    try tmp.dir.createDir(io, "card1-DP-1", .default_dir);
++    try tmp.dir.writeFile(io, .{ .sub_path = "card0-HDMI-A-1/status", .data = "connected\n" });
++    try tmp.dir.writeFile(io, .{ .sub_path = "card1-DP-1/status", .data = "disconnected\n" });
++    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
++    defer std.testing.allocator.free(path);
++    try std.testing.expectError(error.DisplayConnected, headless(std.testing.allocator, io, path, "/dev/dri/card0"));
++    try headless(std.testing.allocator, io, path, "/dev/dri/card1");
++    try tmp.dir.writeFile(io, .{ .sub_path = "card0-HDMI-A-1/status", .data = "disconnected\n" });
++    try headless(std.testing.allocator, io, path, "/dev/dri/card0");
++}
++
++test "place: tensors packed 256-byte aligned and in order, the boundary a page, no tensor across it" {
++    const sizes = [_]usize{ (3 << 20) + 100, 1 << 20, 0, 2 << 20, 5 << 20 };
++    var offs: [5]usize = undefined;
++    const p = try place(&offs, &sizes, 6 << 20);
++    for (offs) |o| try std.testing.expectEqual(@as(usize, 0), o % 256);
++    for (1..sizes.len) |i| try std.testing.expect(offs[i - 1] + sizes[i - 1] <= offs[i]);
++    try std.testing.expectEqual(@as(usize, 0), p.total % page);
++    try std.testing.expectEqual(@as(usize, 0), p.ordinary % page);
++    try std.testing.expectEqual(p.total, p.ordinary + p.display);
++    try std.testing.expect(p.total >= offs[4] + sizes[4]);
++    for (offs, sizes) |o, n| {
++        const end = o + n;
++        try std.testing.expect(end <= p.ordinary or o >= p.ordinary); // wholly on one half
++    }
++    try std.testing.expect(p.display <= 6 << 20);
++    try std.testing.expect(p.display >= 5 << 20); // the last tensor is on the framebuffer
++}
++
++test "place: the framebuffer half never exceeds the budget; all of it when the tensors fit; none when the budget is 0" {
++    const sizes = [_]usize{ 1 << 20, 1 << 20, 3 << 20 };
++    var offs: [3]usize = undefined;
++    const big = try place(&offs, &sizes, 1792 << 20);
++    try std.testing.expectEqual(@as(usize, 0), big.ordinary);
++    try std.testing.expectEqual(big.total, big.display);
++    try std.testing.expectEqual(@as(usize, 0), offs[0]);
++    const none = try place(&offs, &sizes, 0);
++    try std.testing.expectEqual(@as(usize, 0), none.display);
++    try std.testing.expectEqual(none.total, none.ordinary);
++    for (1..8) |k| {
++        const budget = k << 20;
++        const p = try place(&offs, &sizes, budget);
++        try std.testing.expect(p.display <= budget);
++        for (offs, sizes) |o, n| try std.testing.expect(o + n <= p.ordinary or o >= p.ordinary);
++    }
++}
++
++test "place: tensors that are bigger than the budget stay on host pages, in the same order and span size as without it" {
++    const sizes = [_]usize{ 4 << 20, 4 << 20 };
++    var offs: [2]usize = undefined;
++    const p = try place(&offs, &sizes, 2 << 20);
++    try std.testing.expectEqual(@as(usize, 0), p.display);
++    try std.testing.expectEqual(@as(usize, 4 << 20), offs[1]);
++}
++
++/// The OS and driver calls under mapDrm, in the order it makes them; every failure is injected in turn.
++const Fake = struct {
++    d: *const cuda.Driver = undefined,
++    step: usize = 0,
++    fail: usize = 0,
++    closed: usize = 0,
++    gems: usize = 0,
++    unmapped: usize = 0,
++    unregistered: usize = 0,
++    short: bool = false,
++    separate: bool = false,
++    fn next(f: *Fake) !void {
++        f.step += 1;
++        if (f.step == f.fail) return error.Injected;
++    }
++    fn openCard(f: *Fake) !c_int {
++        try f.next();
++        return 3;
++    }
++    fn create(f: *Fake, _: c_int, n: usize) !struct { handle: u32, size: usize } {
++        try f.next();
++        return .{ .handle = 7, .size = if (f.short) n - 1 else n };
++    }
++    fn offset(f: *Fake, _: c_int, _: u32) !u64 {
++        try f.next();
++        return 4096;
++    }
++    fn reserve(f: *Fake, _: usize) !usize {
++        try f.next();
++        return 0x10000;
++    }
++    fn ordinary(f: *Fake, base: usize, n: usize) !void {
++        try f.next();
++        try std.testing.expectEqual(@as(usize, 0x10000), base);
++        try std.testing.expectEqual(@as(usize, 4096), n);
++    }
++    fn display(f: *Fake, base: usize, _: usize, _: c_int, _: u64) !void {
++        try f.next();
++        try std.testing.expect(base == 0x11000 or base == 0x10000);
++    }
++    fn register(f: *Fake, base: usize, _: usize, is_io: bool) !void {
++        try f.next();
++        try std.testing.expectEqual(base != 0x10000 or f.step == 6, is_io);
++    }
++    fn pointer(f: *Fake, base: usize) !u64 {
++        try f.next();
++        return base + if (f.separate and base != 0x10000) @as(usize, 1) else 0;
++    }
++    fn unregister(f: *Fake, _: usize) void {
++        f.unregistered += 1;
++    }
++    fn unmap(f: *Fake, _: usize, _: usize) void {
++        f.unmapped += 1;
++    }
++    fn closeGem(f: *Fake, _: c_int, _: u32) void {
++        f.gems += 1;
++    }
++    fn closeFd(f: *Fake, _: c_int) void {
++        f.closed += 1;
++    }
++};
++
++test "DRM span unwinds every failed step and rejects a short or noncontiguous span" {
++    for (1..11) |fail| {
++        var f: Fake = .{ .fail = fail };
++        try std.testing.expectError(error.Injected, mapDrm(&f, 4096, 16384));
++        try std.testing.expectEqual(@as(usize, @intFromBool(fail > 1)), f.closed);
++        try std.testing.expectEqual(@as(usize, @intFromBool(fail > 2)), f.gems);
++        try std.testing.expectEqual(@as(usize, @intFromBool(fail > 4)), f.unmapped);
++        try std.testing.expectEqual(@as(usize, @intFromBool(fail > 7) + @as(usize, @intFromBool(fail > 8))), f.unregistered);
++    }
++    var f: Fake = .{};
++    const span = try mapDrm(&f, 4096, 16384);
++    try std.testing.expectEqual(@as(u64, 0x10000), span.ptr);
++    try std.testing.expectEqual(@as(usize, 0), f.closed);
++    f = .{ .short = true };
++    try std.testing.expectError(error.DisplayShort, mapDrm(&f, 4096, 16384));
++    try std.testing.expectEqual(@as(usize, 1), f.closed);
++    f = .{ .separate = true };
++    try std.testing.expectError(error.DisplayNotContiguous, mapDrm(&f, 4096, 16384));
++    try std.testing.expectEqual(@as(usize, 2), f.unregistered);
++    f = .{};
++    _ = try mapDrm(&f, 0, 16384);
++    try std.testing.expectEqual(@as(usize, 8), f.step);
++}
++
++/// What `Caches.layout` hands out in a first pass: it records each tensor's size and gives no address.
++pub const Sizer = struct {
++    sizes: [max_tensors]usize = undefined,
++    n: usize = 0,
++    pub const max_tensors = 512;
++    pub fn take(s: *Sizer, bytes: usize) !u64 {
++        if (s.n == max_tensors) return error.DisplayTooManyTensors;
++        s.sizes[s.n] = bytes;
++        s.n += 1;
++        return 0;
++    }
++};
++
++/// What `Caches.layout` hands out in the second pass: the span's tensors at their placed offsets, in the order the first pass saw them.
++pub const Offsets = struct {
++    base: u64,
++    offs: []const usize,
++    at: usize = 0,
++    pub fn take(o: *Offsets, bytes: usize) !u64 {
++        _ = bytes;
++        if (o.at == o.offs.len) return error.DisplayLayoutChanged;
++        defer o.at += 1;
++        return o.base + o.offs[o.at];
++    }
++};
++
++test "sizer then offsets: the second pass hands out the placed addresses in the first pass's order" {
++    var sz: Sizer = .{};
++    for ([_]usize{ 300, 70000, 5 }) |n| try std.testing.expectEqual(@as(u64, 0), try sz.take(n));
++    var offs: [3]usize = undefined;
++    const p = try place(&offs, sz.sizes[0..sz.n], 1 << 20);
++    var o: Offsets = .{ .base = 0x1000, .offs = &offs };
++    for (offs) |want| try std.testing.expectEqual(0x1000 + want, try o.take(0));
++    try std.testing.expectError(error.DisplayLayoutChanged, o.take(0));
++    try std.testing.expect(p.total >= offs[2] + 5);
++}
++
++test "one framebuffer a process: a second claim is refused until the span that holds it is released" {
++    try std.testing.expect(tryClaim());
++    try std.testing.expect(!tryClaim());
++    var span: Span = .{ .ptr = 0, .d = undefined, .owns_claim = true };
++    span.deinit();
++    try std.testing.expect(tryClaim());
++    releaseClaim();
++}
+diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
+index 847b4b29b902379dccf1290bc8b4097d488fb800..5c63510c55aee289e190a042729c27fe285dd5e5 100644
+--- a/zig/src/families/dsv41/dsv41.zig
++++ b/zig/src/families/dsv41/dsv41.zig
+@@ -32,6 +32,7 @@ pub const ops = @import("ops.zig");
+ pub const exl3_experts = @import("exl3_experts.zig");
+ pub const exl3_experts_rec = @import("exl3_experts_rec.zig");
+ pub const prompt = @import("prompt.zig");
++pub const display = @import("display.zig");
+ pub const exact = @import("exact.zig");
+ pub const rdma_seq = @import("rdma_seq.zig");
+ pub const rdma = @import("rdma.zig");
+@@ -61,6 +62,7 @@ test {
+     // every declaration of every file, so functions no test calls are still compiled
+     const refAll = @import("std").testing.refAllDecls;
+     refAll(@import("config.zig"));
++    refAll(display);
+     refAll(native);
+     refAll(rank_cache);
+     refAll(plan);
+diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
+index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3095d76dc 100644
+--- a/zig/src/families/dsv41/model.zig
++++ b/zig/src/families/dsv41/model.zig
+@@ -11,6 +11,7 @@ const Config = @import("config.zig").Config;
+ const rank_cache = @import("rank_cache.zig");
+ const weights = @import("weights.zig");
+ const prompt = @import("prompt.zig");
++const display = @import("display.zig");
+ const prompt2d = @import("prompt2d.zig");
+ const round = @import("round.zig");
+ const draft = @import("draft.zig");
+@@ -73,6 +74,27 @@ pub const Options = struct {
+     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
+ };
+ 
++/// The RoPE table rows Model.open loads for streams whose extents take up to `extent` positions (Model.request_cap): a
++/// stream's positions are its own, from 0 at its extent's base (prompt.begin's `start`, a decode row's window start +
++/// j; the pool or part position only picks the cache rows, Caches.view), so the tables cover one extent and a round's
++/// rows past it, however large the pool or a part is.
++pub fn ropeRows(extent: usize) usize {
++    return pool_mod.ropeRows(extent, round.max_rows); // 0008's rows: the positions, a round's rows and one
++}
++
++/// The kit's tables (`table_rows` positions each) cover an extent of `extent` positions, else error.RopeTableTooShort.
++pub fn ropeFits(extent: usize, table_rows: usize) !void {
++    if (ropeRows(extent) > table_rows) return error.RopeTableTooShort;
++}
++
++/// The longest window (prompt + reply tokens) whose extent (shard.plan's: alignForward(window + round_rows + 2,
++/// shard.block)) the kit's tables of `table_rows` positions cover; 0 when none does.
++pub fn maxRopeWindow(table_rows: usize, round_rows: usize) usize {
++    const room = table_rows -| (round.max_rows + 1);
++    const extent = std.mem.alignBackward(usize, room, shard.block);
++    return extent -| (round_rows + 2);
++}
++
+ pub const Model = struct {
+     gpa: std.mem.Allocator,
+     host: std.heap.ArenaAllocator, // allocations that live as long as the model
+@@ -110,6 +132,7 @@ pub const Model = struct {
+     rd: round.Round,
+     graphs: ?round.Graphs = null,
+     pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
++    kv_span: ?display.Span = null, // the KV caches on the framebuffer reservation (TF_DS_DISPLAY_KV_MIB)
+     dpool: ?draft.Pool = null,
+     dr: ?draft.Drafter = null,
+     tables: ?engram_io.Tables = null,
+@@ -188,6 +211,7 @@ pub const Model = struct {
+         m.t_enqueue = 0;
+         m.t_forward = 0;
+         m.t_absorb = 0;
++        m.kv_span = null;
+         m.dpool = null;
+         m.dr = null;
+         m.tables = null;
+@@ -276,11 +300,10 @@ pub const Model = struct {
+         m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
+         errdefer m.ex.unload();
+ 
+-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream can reach (the window, not the pool)
++        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream's extent may
++        // take (ropeRows: positions are the stream's own, never the pool's or a part's)
+         const half = c.rope_dim / 2;
+-        // (0008's ropeRows over the longest extent a stream may take: the window's rows rounded up to whole blocks,
+-        // and in a part when sharded; the pool's only when the pool is the window)
+-        const rope_rows = pool_mod.ropeRows(m.request_cap, round.max_rows);
++        const rope_rows = ropeRows(m.request_cap);
+         m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
+         errdefer m.rope_buf.free();
+         {
+@@ -289,7 +312,12 @@ pub const Model = struct {
+             for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
+                 var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
+                 defer f.close(io);
+-                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the window
++                const table_rows: usize = @intCast(try f.length(io) / (half * 4));
++                ropeFits(m.request_cap, table_rows) catch |err| {
++                    std.log.err("dsv41: the kit's RoPE tables ({s}) hold {d} positions; a conversation's extent of {d} positions (pool {d}, window {d}) needs {d}: serve a window of at most {d} tokens (--context, and TF_DS_WINDOW on a follower; without either the window is the pool)", .{ name, table_rows, m.request_cap, pool, window, rope_rows, maxRopeWindow(table_rows, o.round_rows) });
++                    return err;
++                };
++                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the extent
+                 try m.rope_buf.upload(j * part.len, part);
+             }
+         }
+@@ -326,9 +354,14 @@ pub const Model = struct {
+             const sh = try shard.Shard.init(o.rank, o.world, pool, round.max_rows);
+             m.kvs = .{ .sh = sh, .mode = mode, .k = try shard_ops.Kernels.load(d, cuda.kernels.dsv41_shard) };
+             m.eng.kv = &m.kvs.?;
+-            m.caches = try prompt.Caches.initShard(&m.eng, &m.arena, pool, m.streams, sh);
+-            try m.ch.useShard(&m.eng, &m.arena, prompt.prompt_fetch_rows, m.request_cap);
+-        } else m.caches = try prompt.Caches.init(&m.eng, &m.arena, pool, m.streams);
++            m.caches = try m.makeCaches(gpa, io, pool, sh);
++        } else m.caches = try m.makeCaches(gpa, io, pool, null);
++        errdefer if (m.kv_span) |*x| {
++            m.stream.synchronize() catch {}; // the clear's memsets may still be queued on the span
++            x.deinit();
++            m.kv_span = null;
++        };
++        if (m.kvs != null) try m.ch.useShard(&m.eng, &m.arena, prompt.prompt_fetch_rows, m.request_cap);
+         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
+         errdefer m.blas.close();
+         m.eng.blas = &m.blas;
+@@ -465,6 +498,47 @@ pub const Model = struct {
+         return .{ .mode = mode, .pool = pool, .window = window };
+     }
+ 
++    /// The KV caches (`sh`: TF_DS_KV_SHARD's parts, null replicated): from the arena, or with TF_DS_DISPLAY_KV_MIB
++    /// (display.zig) the tensors that fit on the framebuffer reservation's half of one span and the rest on host pages
++    /// beside it. Sharded, this rank's owner planes (its part's compressed codes and scales) are the ones placed there
++    /// first (prompt.Caches.Order.owner_last); replicated, the arena's order (the last layers' tensors first).
++    fn makeCaches(m: *Model, gpa: std.mem.Allocator, io: std.Io, pool: usize, sh: ?shard.Shard) !prompt.Caches {
++        const cfg = try display.Config.read();
++        if (cfg.bytes == 0) {
++            if (sh) |x| return prompt.Caches.initShard(&m.eng, &m.arena, pool, m.streams, x);
++            return prompt.Caches.init(&m.eng, &m.arena, pool, m.streams);
++        }
++        const order: prompt.Caches.Order = if (sh != null) .owner_last else .layers;
++        var sizer: display.Sizer = .{};
++        _ = try prompt.Caches.layout(&m.eng, &sizer, pool, m.streams, sh, order);
++        var offs: [display.Sizer.max_tensors]usize = undefined;
++        const sizes = sizer.sizes[0..sizer.n];
++        const plan = try display.place(offs[0..sizer.n], sizes, cfg.bytes);
++        const owner_from = if (sh != null) sizer.n - prompt.Caches.compTensors(&m.eng) else sizer.n;
++        const sp = display.split(offs[0..sizer.n], sizes, plan, owner_from);
++        if (plan.display == 0) {
++            std.log.info("dsv41: rank {d} KV caches: 0 MiB on the display reserve ({s}: no tensor fits {d} MiB), {d} MiB in normal memory", .{ m.rank, cfg.card, cfg.bytes >> 20, sp.total >> 20 });
++            if (sh) |x| return prompt.Caches.initShard(&m.eng, &m.arena, pool, m.streams, x);
++            return prompt.Caches.init(&m.eng, &m.arena, pool, m.streams);
++        }
++        m.kv_span = try display.map(gpa, io, m.eng.d, cfg.card, plan);
++        errdefer {
++            m.stream.synchronize() catch {};
++            m.kv_span.?.deinit();
++            m.kv_span = null;
++        }
++        var at: display.Offsets = .{ .base = m.kv_span.?.ptr, .offs = offs[0..sizer.n] };
++        const cs = try prompt.Caches.layout(&m.eng, &at, pool, m.streams, sh, order);
++        if (at.at != sizer.n) return error.DisplayLayoutChanged;
++        try cs.clear(&m.eng);
++        if (sh != null) {
++            std.log.info("dsv41: rank {d} KV caches: {d} MiB on the display reserve ({s}; owner planes {d} of {d} MiB), {d} MiB in normal memory", .{ m.rank, sp.display >> 20, cfg.card, sp.owner_display >> 20, sp.owner >> 20, sp.ordinary >> 20 });
++        } else {
++            std.log.info("dsv41: rank {d} KV caches: {d} MiB on the display reserve ({s}), {d} MiB in normal memory", .{ m.rank, sp.display >> 20, cfg.card, sp.ordinary >> 20 });
++        }
++        return cs;
++    }
++
+     /// The start-up's note of what it serves when the pool is not the window or the shard is on: the pool, its parts,
+     /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
+     /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
+@@ -520,6 +594,7 @@ pub const Model = struct {
+         m.blas.close();
+         if (m.kvs) |*x| x.k.unload();
+         m.arena.deinit();
++        if (m.kv_span) |*x| x.deinit();
+         m.rope_buf.free();
+         m.ex.unload();
+         m.ops.unload();
+@@ -1376,3 +1451,29 @@ test "pickWindow: --context wins and must match TF_DS_WINDOW; a follower takes T
+     try std.testing.expectEqual(@as(?usize, 2101248), try Model.pickWindow(null, 2101248, "9999999")); // never past the pool
+     try std.testing.expectEqual(@as(?usize, null), try Model.pickWindow(null, 2101248, null));
+ }
++
++test "RoPE tables cover an extent, not the pool: a sharded 4M pool serves a 1M window from 1,114,112-row tables, a pool-wide window is refused" {
++    const table_rows: usize = 1_114_112; // the kit's rope-*.f32 tables
++    const R: usize = 16;
++    // the recipe's default today and the larger sharded pool: parts of 1,050,624 and 2,101,248 positions, the same 1M window
++    for ([_]usize{ 2_101_248, 4_202_496, 8_404_992 }) |pool| {
++        const pl = try shard.plan(pool, 1_048_576, R, 2, true);
++        try std.testing.expectEqual(@as(usize, 1_048_576), pl.window);
++        try std.testing.expectEqual(@as(usize, 1_050_624), pl.extent); // the window's, not the part's
++        try ropeFits(pl.extent, table_rows);
++    }
++    // no window given (the engine alone: the window defaults to the pool): sharded, no part holds a pool-wide window
++    // (shard.plan refuses it); replicated, the extent is the whole 2,101,248-position pool, past the tables
++    try std.testing.expectError(error.PartTooSmall, shard.plan(4_202_496, 4_202_496, R, 2, true));
++    const wide = try shard.plan(2_101_248, 2_101_248, R, 2, false);
++    try std.testing.expectEqual(@as(usize, 2_101_248), wide.extent);
++    try std.testing.expectError(error.RopeTableTooShort, ropeFits(wide.extent, table_rows));
++    // replicated, a pool past the tables with a 1M window: fits the same way (TF_DS_POOL without the shard)
++    try ropeFits((try shard.plan(2_101_248, 1_048_576, R, 2, false)).extent, table_rows);
++    // the longest window the error suggests fits exactly, one token more does not
++    const w = maxRopeWindow(table_rows, R);
++    try std.testing.expectEqual(@as(usize, 1_112_064 - R - 2), w);
++    try ropeFits((try shard.plan(4_202_496, w, R, 2, true)).extent, table_rows);
++    try std.testing.expectError(error.RopeTableTooShort, ropeFits((try shard.plan(4_202_496, w + 1, R, 2, true)).extent, table_rows));
++    try std.testing.expectEqual(@as(usize, 0), maxRopeWindow(10, R));
++}
+diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
+index 959ad6592b340c632504d8405285063308da5084..72455d8de332edc8ad20105009451780d3cf6b66 100644
+--- a/zig/src/families/dsv41/prompt.zig
++++ b/zig/src/families/dsv41/prompt.zig
+@@ -632,28 +632,59 @@ pub const Caches = struct {
+     }
+ 
+     fn initParts(e: *const Engine, a: *Arena, cap: usize, slots: usize, sh: ?shard.Shard) !Caches {
++        const cs = try layout(e, a, cap, slots, sh, .layers);
++        try cs.clear(e);
++        return cs;
++    }
++
++    /// The order layout() takes the caches' tensors in. `layers`: layer by layer, each layer's compressed codes and
++    /// scales, index keys, raw stores (the arena's order). `owner_last` (TF_DS_DISPLAY_KV_MIB with TF_DS_KV_SHARD):
++    /// every layer's index keys and raw stores first, then every layer's compressed codes and scales (this rank's
++    /// part), so display.place, which fills the framebuffer from the last tensor back, puts the owner planes there
++    /// first.
++    pub const Order = enum { layers, owner_last };
++
++    /// The caches' tensors, each from `t.take(bytes)` (an Arena, or display.Sizer / display.Offsets when the KV goes on
++    /// the framebuffer), in `order`; `sh` as initShard's (null: replicated). No GPU work: the tensors are not cleared.
++    pub fn layout(e: *const Engine, t: anytype, cap: usize, slots: usize, sh: ?shard.Shard, order: Order) !Caches {
+         const c = e.c;
+         var cs: Caches = .{ .cap = cap, .slots = slots, .shard = sh };
++        if (sh) |x| if (x.pool != cap) return error.BadShard;
++        const comp_first = order == .layers;
+         for (e.w.layers, 0..) |lay, i| {
+             if (lay.comp_wkv == null) continue;
+             const r: usize = lay.ratio;
+             const rows = cap / r + 2;
+-            const crows = cs.compRows(r);
+-            cs.comp_codes[i] = try a.take(crows * c.head_dim / 2);
+-            cs.comp_scales[i] = try a.take(crows * c.head_dim / 16);
++            if (comp_first) {
++                const crows = cs.compRows(r);
++                cs.comp_codes[i] = try t.take(crows * c.head_dim / 2);
++                cs.comp_scales[i] = try t.take(crows * c.head_dim / 16);
++            }
+             if (lay.idx_wk != null) {
+-                cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
+-                cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
++                cs.idx_codes[i] = try t.take(rows * c.index_head_dim / 2);
++                cs.idx_scales[i] = try t.take(rows * c.index_head_dim / 32);
+             }
+             if (r > 1) {
+-                cs.raw_kv[i] = try a.take(slots * raw_rows * c.head_dim * 4);
+-                cs.raw_score[i] = try a.take(slots * raw_rows * c.head_dim * 4);
++                cs.raw_kv[i] = try t.take(slots * raw_rows * c.head_dim * 4);
++                cs.raw_score[i] = try t.take(slots * raw_rows * c.head_dim * 4);
+             }
+         }
+-        try cs.clear(e);
++        if (!comp_first) for (e.w.layers, 0..) |lay, i| {
++            if (lay.comp_wkv == null) continue;
++            const crows = cs.compRows(lay.ratio);
++            cs.comp_codes[i] = try t.take(crows * c.head_dim / 2);
++            cs.comp_scales[i] = try t.take(crows * c.head_dim / 16);
++        };
+         return cs;
+     }
+ 
++    /// How many of layout()'s tensors are compressed codes and scales (owner_last: its last ones).
++    pub fn compTensors(e: *const Engine) usize {
++        var n: usize = 0;
++        for (e.w.layers) |lay| n += @as(usize, @intFromBool(lay.comp_wkv != null)) * 2;
++        return n;
++    }
++
+     /// Rows of a ratio-`r` source's compressed codes (and scales) on this rank: the pool's and two, or sharded its
+     /// part's, two and the trash rows.
+     pub fn compRows(cs: *const Caches, r: usize) usize {
+@@ -1638,3 +1669,83 @@ fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
+     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
+     return error.NotPortedYet;
+ }
++
++/// An Engine with only the config and the layers' shapes (Caches.layout's host-side reading), for placement tests.
++fn shapeEngine(c: *const Config, w: *weights.Weights, layers: []weights.Layer) Engine {
++    for (layers, 0..) |*l, i| {
++        const kv = c.kv_sources.has(i);
++        l.* = .{ .idx = @intCast(i), .ratio = c.ratios[i], .comp_wkv = if (kv) @as(weights.Linear, undefined) else null, .idx_wk = if (kv and c.index_sources.has(i)) @as(weights.Linear, undefined) else null };
++    }
++    w.layers = layers;
++    return .{ .d = undefined, .s = undefined, .t = undefined, .blas = undefined, .comm = undefined, .pf = undefined, .lin = undefined, .ex = undefined, .ops = undefined, .exact = undefined, .c = c, .w = w, .world = 2, .plain = undefined, .compressed = undefined };
++}
++
++test "display KV with the shard: each rank's owner planes go on the framebuffer first, the rest on host pages; replicated as the arena orders them" {
++    const display = @import("display.zig");
++    var why: @import("config.zig").Why = .{};
++    const c = try @import("config.zig").parse(std.testing.allocator, @import("config.zig").test_config, &why);
++    var layers: [64]weights.Layer = undefined;
++    var w: weights.Weights = .{ .gpa = std.testing.allocator };
++    const e = shapeEngine(&c, &w, layers[0..c.layers]);
++    const budget: usize = 1792 << 20; // a headless GB10's reservation, as the recipe's examples ask
++    const ncomp = Caches.compTensors(&e);
++    try std.testing.expectEqual(@as(usize, 8), ncomp); // 4 kv sources' codes and scales
++    for ([_]usize{ 2_101_248, 4_202_496, 8_404_992 }) |pool| {
++        for (0..2) |rank| {
++            const sh = try shard.Shard.init(@intCast(rank), 2, pool, 48);
++            var sz: display.Sizer = .{};
++            const sized = try Caches.layout(&e, &sz, pool, 8, sh, .owner_last);
++            var offs: [display.Sizer.max_tensors]usize = undefined;
++            const p = try display.place(offs[0..sz.n], sz.sizes[0..sz.n], budget);
++            const s = display.split(offs[0..sz.n], sz.sizes[0..sz.n], p, sz.n - ncomp);
++            try std.testing.expect(p.display <= budget and s.display > 0);
++            try std.testing.expectEqual(s.total, s.display + s.ordinary);
++            // the owner planes: this rank's part's rows only (planeRows), every one of them sized
++            var owner: usize = 0;
++            for (e.w.layers) |lay| if (lay.comp_wkv != null) {
++                owner += sh.planeRows(lay.ratio) * (c.head_dim / 2 + c.head_dim / 16);
++            };
++            try std.testing.expectEqual(owner, s.owner);
++            if (s.owner + display.page <= budget) {
++                // they all fit: every owner byte on the framebuffer, the room left to the last index keys and raw stores
++                try std.testing.expectEqual(s.owner, s.owner_display);
++            } else {
++                // they do not: the framebuffer holds owner planes only, nothing else displaced them
++                try std.testing.expectEqual(s.display, s.owner_display);
++            }
++            // the second pass: the placed addresses, the same tensors, no tensor across the two halves
++            var at: display.Offsets = .{ .base = 1 << 40, .offs = offs[0..sz.n] };
++            const cs = try Caches.layout(&e, &at, pool, 8, sh, .owner_last);
++            try std.testing.expectEqual(sz.n, at.at);
++            try std.testing.expectEqual(sized.shard.?.part, cs.shard.?.part);
++            for (e.w.layers, 0..) |lay, i| if (lay.comp_wkv != null) {
++                const o = cs.comp_codes[i] - (1 << 40);
++                if (s.owner_display == s.owner) try std.testing.expect(o >= p.ordinary);
++            };
++            for (offs[0..sz.n], sz.sizes[0..sz.n]) |o, n| try std.testing.expect(o + n <= p.ordinary or o >= p.ordinary);
++        }
++    }
++    // the 4M pool: 1,442 MiB of owner planes a rank fit a 1792 MiB reservation whole
++    {
++        const sh = try shard.Shard.init(0, 2, 4_202_496, 48);
++        var sz: display.Sizer = .{};
++        _ = try Caches.layout(&e, &sz, 4_202_496, 8, sh, .owner_last);
++        var offs: [display.Sizer.max_tensors]usize = undefined;
++        const p = try display.place(offs[0..sz.n], sz.sizes[0..sz.n], budget);
++        const s = display.split(offs[0..sz.n], sz.sizes[0..sz.n], p, sz.n - ncomp);
++        try std.testing.expectEqual(s.owner, s.owner_display);
++        try std.testing.expectEqual(@as(usize, 1442), s.owner >> 20);
++    }
++    // replicated: the arena's order (layer by layer), the same tensors as the arena takes
++    {
++        var sz: display.Sizer = .{};
++        _ = try Caches.layout(&e, &sz, 1_048_576, 8, null, .layers);
++        var ar: display.Sizer = .{};
++        _ = try Caches.layout(&e, &ar, 1_048_576, 8, null, .owner_last);
++        try std.testing.expectEqual(sz.n, ar.n);
++        try std.testing.expectEqual(sz.sizes[0], c.head_dim / 2 * (1_048_576 / 2 + 2)); // layer 2's codes first
++    }
++    // a shard of another pool is refused
++    var bad: display.Sizer = .{};
++    try std.testing.expectError(error.BadShard, Caches.layout(&e, &bad, 1_048_576, 8, try shard.Shard.init(0, 2, 2_101_248, 48), .owner_last));
++}

@@ -16,8 +16,8 @@
 #   --dry-run         build and check the patches in a temporary folder, print what would change, write nothing
 #   --engine DIR      the engine repository (default ~/GitHub/tensorfold-dsv41)
 #   --branch REF      what to export (required): engine work on top of BASE
-#   --base REF        what it is relative to: TF_REF plus the hand-written patches (default port/series-pair-370daf0,
-#                     the tip of the series zig/patches carries)
+#   --base REF        what it is relative to: TF_REF plus the hand-written patches (default
+#                     port/series-display-kv-pair-370daf0, the series and 0024 that zig/patches carries)
 #   --mode            commits (default: one patch per first-parent commit, as the series) or squash (one patch,
 #                     NNNN-<name>.patch)
 #   --name SLUG       the squashed patch's name (default spill-kvshard)
@@ -49,7 +49,7 @@ newreadme() {  # <readme> <rows file>: the README with the generated rows replac
 # Sourced with PORT_PATCHES_LIB=1 (scripts/port_test.sh): define newreadme and stop here
 [[ "${PORT_PATCHES_LIB:-0}" != 1 ]] || return 0
 
-engine="$HOME/GitHub/tensorfold-dsv41"; branch=""; base=port/series-pair-370daf0; mode=commits; name=spill-kvshard
+engine="$HOME/GitHub/tensorfold-dsv41"; branch=""; base=port/series-display-kv-pair-370daf0; mode=commits; name=spill-kvshard
 title="Robert Wojciechowski's (GitHub wojo, X @rwojo) GLM-5.3-Flash patches 0088/0110/0111/0118/0119 (spill v2, continuation, KV sharding with prompt borrowing and the ring exchange on 0008's pool, parked pages; GLM PRs #78 #124 #128 #152 #149), ported by him to the native dsv41 engine"
 dry=0; keep=0; defaults=1; excludes=()
 while (( $# )); do
