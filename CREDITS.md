@@ -34,7 +34,7 @@ License 2.0 ([`LICENSE`](LICENSE)); [`NOTICE`](NOTICE) carries the notices that 
   plain linears over a fixed row count, `TF_DS_PLAIN_ROWS`), the `EAQ_V1_1` setting and its pins, the second checkout's
   patches in `zig/Dockerfile`, and `scripts/test_mixed_pack_patch.py`. His patches `0009`, `0011` and `0012` were
   renumbered `0024`-`0026` and rebased after the port's series by Mia's AI Lab.
-- **Display-reserve KV** (`DISPLAY_KV_MIB`, `DISPLAY_KV_CARD`; the engine's `display.zig`, carried in `zig/patches/0024-display-kv.patch`) was authored by
+- **Display-reserve KV** (`DISPLAY_KV_MIB`, `DISPLAY_KV_CARD`; the engine's `display.zig`, carried in `zig/patches/0030-display-kv.patch`) was authored by
   **E-Zou Shen ([ezoushen](https://github.com/ezoushen))** in [pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9)
   of this repository (patch `0007-display-kv`, commits `0f33c49` and `24e1f1f`): a port of the DRM-framebuffer backend of Mia's AI Lab's TensorFold GLM engine
   (`glm_cuda/cuda_display_kv.zig`, itself from the TensorFold contributors) to this engine's KV caches, Apache-2.0. `display.zig` is carried as he wrote it; its

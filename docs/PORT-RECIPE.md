@@ -245,13 +245,13 @@ on the Sparks: rank 1 killed, or SIGSTOPped, while 8 streams decode.
 ## Exporting the engine branch: `scripts/port-patches.sh`
 
 ```
-scripts/port-patches.sh --branch REF --dry-run        # REF of ~/GitHub/tensorfold-dsv41, one patch a first-parent commit
-scripts/port-patches.sh --branch REF                  # the same, written into zig/patches and its README
-scripts/port-patches.sh --branch REF --mode squash --name SLUG --title TEXT   # one patch instead
+scripts/port-patches.sh --base BASE --branch REF --dry-run        # REF of ~/GitHub/tensorfold-dsv41, one patch a first-parent commit
+scripts/port-patches.sh --base BASE --branch REF                  # the same, written into zig/patches and its README
+scripts/port-patches.sh --base BASE --branch REF --mode squash --name SLUG --title TEXT   # one patch instead
 scripts/port-patches.sh --engine DIR --base REF --exclude PATH --keep         # another repository, base or exclusion
 ```
 
-`--base` defaults to the engine branch that `zig/patches` reproduces (`--help` names it), so `REF` is engine work on
+`--base` is required and must name an engine commit containing all current `zig/patches`, so `REF` is engine work on
 top of it, exported as the next numbers. It writes nothing unless a clean `TF_REF` checkout plus the hand-written
 patches equals the base, every new patch passes `git apply --check` and applies there in filename order (as
 `zig/Dockerfile` applies them), and the result equals the branch outside the port's own notes (`PORT.md`,
@@ -266,9 +266,9 @@ is the procedure for that checkout (a new tree from this branch beside the old o
 unit; rolled back by swapping back). The steps below are the general ones for a checkout that serves directly.
 
 1. **Engine branch ready.** Engine work after the series (a branch on top of the one `zig/patches` reproduces:
-   `port/series-pair-370daf0` with the series alone) checked as `PORT.md` asks (host tests, the Linux cross-build;
+   a base containing all current patches, including upstream 0024–0029 and display reserve 0030) checked as `PORT.md` asks (host tests, the Linux cross-build;
    GPU checks on the pair by the coordinator). With nothing after the series, go on at step 3.
-2. **Export.** `scripts/port-patches.sh --branch <engine branch> --dry-run`, then without `--dry-run`; commit
+2. **Export.** `scripts/port-patches.sh --base <engine base> --branch <engine branch> --dry-run`, then without `--dry-run`; commit
    `zig/patches` on the recipe branch.
 3. **Record what serves now**, to come back to. A live checkout may carry working-tree edits, and its image tag is a
    hash of `zig/patches` and `zig/Dockerfile` as they are on disk, so record the commit **and** the diff. In the live

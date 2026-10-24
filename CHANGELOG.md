@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Fork main rebuilt on upstream `27741e1`: display reserve follows upstream patches 0024–0029 as
+  `0030-display-kv.patch`; spill, KV sharding and display fallback defaults are retained. Engine patch export now
+  requires an explicit `--base` containing all current patches; the old display-only engine base lacks the new upstream fixes.
+
 - `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of
   the checkpoint index (the shards stay hard links), so the graft no longer fails with `PermissionError` when it rewrites
   the index (issue #42, reported by unitea1992). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,
@@ -48,7 +52,7 @@
 
 - Display-reserve KV, `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only), by **ezoushen**
   ([pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9), its patch `0007-display-kv` ported as
-  `zig/patches/0024-display-kv.patch`): the KV caches on the framebuffer the UEFI reserves, so their bytes leave the host's `MemAvailable`
+  `zig/patches/0030-display-kv.patch`): the KV caches on the framebuffer the UEFI reserves, so their bytes leave the host's `MemAvailable`
   (the GLM-5.3-Flash recipe's display-KV idea). With `KV_SHARD=1` each Spark puts its own part's compressed planes (the owner rows) there first and
   the replicated index keys and raw stores after them; each rank logs at start how many MiB went to the reserve and how many to normal memory.
   Measured in #9 on the stock recipe (replicated KV, 893 MiB a rank, all of it on the framebuffer): the head's idle `MemAvailable` went from

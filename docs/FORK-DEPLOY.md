@@ -24,14 +24,14 @@ Make the new tree beside the old one and swap the two folders, so the drop-in's 
 stays whole for a rollback.
 
 1. **On the Mac (no Spark involved).** The engine is in `zig/patches` already (the series `0011` to `0022`, then `0023` and
-   ezoushen's display reserve `0024`). Export engine work made after it (on top of the engine's
-   `port/series-display-kv-pair-370daf0`) as `0025-...`, commit it on `main`, then bundle the branch:
+   upstream fixes `0024`–`0029` and ezoushen's display reserve `0030`). Export engine work made after it
+   (on top of an engine base containing all current patches) as `0031-...`, commit it on `main`, then bundle the branch:
 
    ```
    cd ~/GitHub/deepseek1017-recipe-port
-   scripts/port-patches.sh --base port/series-display-kv-pair-370daf0 --branch <engine branch> --dry-run   # then without --dry-run
+   scripts/port-patches.sh --base <engine-base> --branch <engine branch> --dry-run   # then without --dry-run
    bash scripts/port_test.sh && python3 -I tools/selftest.py      # the golden start.sh test skips here: step 4
-   git add zig/patches && git commit -m "zig/patches: 0025-... = <engine branch> <hash>"
+   git add zig/patches && git commit -m "zig/patches: 0031-... = <engine branch> <hash>"
    git bundle create ~/port-recipe.bundle main
    scp ~/port-recipe.bundle gx10-a:
    ```
@@ -57,7 +57,7 @@ stays whole for a rollback.
    git clone --quiet --branch main ~/port-recipe.bundle ~/DeepSeek-port.next
    cp -p ~/DeepSeek-port/scripts/local.sh ~/DeepSeek-port.next/scripts/local.sh
    [ -f ~/DeepSeek-port/.env ] && cp -p ~/DeepSeek-port/.env ~/DeepSeek-port.next/.env
-   ls ~/DeepSeek-port.next/zig/patches/       # 0001 0002 0004 0005 0006 0008 0010, then 0011 to 0024: one port only
+   ls ~/DeepSeek-port.next/zig/patches/       # 0001 0002 0004 0005 0006 0008 0010, then 0011 to 0030: one port only
    ```
 
    Only one copy of the port may be in `zig/patches` (an older `0007-...` or `0011-spill-kvshard.patch` export and the

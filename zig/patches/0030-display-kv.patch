@@ -21,7 +21,8 @@
 # DISPLAY_KV_MIB=1792: 1,791 MiB a rank on the reserve (all of its owner planes), 852 MiB in normal memory; exact.py
 # 39 of 39 identical; the lowest MemAvailable during a 227,640-token prompt 6.57 / 8.32 GiB, against 6.44 / 8.22 GiB
 # for 2,101,248 positions without the reserve.
-# Applies after 0023 (engine port/series-display-kv-pair-370daf0: one commit on port/series-pair-370daf0).
+# Applies after upstream 0024-0029 as 0030; originally after 0023 in engine
+# port/series-display-kv-pair-370daf0 (one commit on port/series-pair-370daf0).
 # display.zig by E-Zou Shen (@ezoushen); its wiring onto the pool and window and KV sharding by Robert Wojciechowski
 # (GitHub @wojo, X @rwojo). Apache-2.0.
 diff --git a/zig/src/cuda/abi.zig b/zig/src/cuda/abi.zig

@@ -164,7 +164,7 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
-# Display-reserve KV (ezoushen's PR #9, zig/patches/0024-display-kv): the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb buffer on
+# Display-reserve KV (ezoushen's PR #9, zig/patches/0030-display-kv): the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb buffer on
 # DISPLAY_KV_CARD mapped into the GPU's address space), so their bytes leave the host's MemAvailable. MiB of it to use, whole steps
 # of 16, at most 2032; the tensors that fit go there (with KV_SHARD=1 this Spark's owner planes first), the rest stay on ordinary memory. 0: off. It needs no display
 # connected to the card (the engine checks); both ranks take it. TF_DS_DISPLAY_KV_MIB and TF_DS_DISPLAY_KV_CARD. The containers get the one
