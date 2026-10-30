@@ -17,7 +17,7 @@
 #   --engine DIR      the engine repository (default ~/GitHub/tensorfold-dsv41)
 #   --branch REF      what to export (required): engine work on top of BASE
 #   --base REF        what it is relative to: TF_REF plus all current hand-written patches (required; the old
-#                     port/series-display-kv-pair-370daf0 lacks upstream patches 0024-0029)
+#                     port/series-display-kv-pair-370daf0 lacks upstream patches 0024-0038)
 #   --mode            commits (default: one patch per first-parent commit, as the series) or squash (one patch,
 #                     NNNN-<name>.patch)
 #   --name SLUG       the squashed patch's name (default spill-kvshard)

@@ -21,7 +21,8 @@
 # DISPLAY_KV_MIB=1792: 1,791 MiB a rank on the reserve (all of its owner planes), 852 MiB in normal memory; exact.py
 # 39 of 39 identical; the lowest MemAvailable during a 227,640-token prompt 6.57 / 8.32 GiB, against 6.44 / 8.22 GiB
 # for 2,101,248 positions without the reserve.
-# Applies after upstream 0024-0029 as 0030; originally after 0023 in engine
+# Applies after upstream 0024-0038 as 0039 on the fbbc971 pin (two hunks re-anchored: an import in model.zig, the
+# placement test at the end of prompt.zig); before that after 0024-0029 as 0030, and first after 0023 in engine
 # port/series-display-kv-pair-370daf0 (one commit on port/series-pair-370daf0).
 # display.zig by E-Zou Shen (@ezoushen); its wiring onto the pool and window and KV sharding by Robert Wojciechowski
 # (GitHub @wojo, X @rwojo). Apache-2.0.
@@ -508,10 +509,10 @@ index 0000000000000000000000000000000000000000..dec3262bf5fbaa86c1d5f75a728ca085
 +    releaseClaim();
 +}
 diff --git a/zig/src/families/dsv41/dsv41.zig b/zig/src/families/dsv41/dsv41.zig
-index 847b4b29b902379dccf1290bc8b4097d488fb800..5c63510c55aee289e190a042729c27fe285dd5e5 100644
+index c5fd1125d6d936687195f8e33fd4114a8debf52b..0482ea54adc6af81b480b2e09d95f1841e4f4d85 100644
 --- a/zig/src/families/dsv41/dsv41.zig
 +++ b/zig/src/families/dsv41/dsv41.zig
-@@ -32,6 +32,7 @@ pub const ops = @import("ops.zig");
+@@ -33,6 +33,7 @@ pub const ops = @import("ops.zig");
  pub const exl3_experts = @import("exl3_experts.zig");
  pub const exl3_experts_rec = @import("exl3_experts_rec.zig");
  pub const prompt = @import("prompt.zig");
@@ -519,7 +520,7 @@ index 847b4b29b902379dccf1290bc8b4097d488fb800..5c63510c55aee289e190a042729c27fe
  pub const exact = @import("exact.zig");
  pub const rdma_seq = @import("rdma_seq.zig");
  pub const rdma = @import("rdma.zig");
-@@ -61,6 +62,7 @@ test {
+@@ -63,6 +64,7 @@ test {
      // every declaration of every file, so functions no test calls are still compiled
      const refAll = @import("std").testing.refAllDecls;
      refAll(@import("config.zig"));
@@ -528,7 +529,7 @@ index 847b4b29b902379dccf1290bc8b4097d488fb800..5c63510c55aee289e190a042729c27fe
      refAll(rank_cache);
      refAll(plan);
 diff --git a/zig/src/families/dsv41/model.zig b/zig/src/families/dsv41/model.zig
-index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3095d76dc 100644
+index 7d55f83758bde189e2e1a2d3071340d0673cd3df..da35bd5313e754a279791c061a04b8702a4a12d1 100644
 --- a/zig/src/families/dsv41/model.zig
 +++ b/zig/src/families/dsv41/model.zig
 @@ -11,6 +11,7 @@ const Config = @import("config.zig").Config;
@@ -536,10 +537,10 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
  const weights = @import("weights.zig");
  const prompt = @import("prompt.zig");
 +const display = @import("display.zig");
+ const engram_lead = @import("engram_lead.zig");
  const prompt2d = @import("prompt2d.zig");
  const round = @import("round.zig");
- const draft = @import("draft.zig");
-@@ -73,6 +74,27 @@ pub const Options = struct {
+@@ -77,6 +78,27 @@ pub const Options = struct {
      vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
  };
  
@@ -567,7 +568,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
  pub const Model = struct {
      gpa: std.mem.Allocator,
      host: std.heap.ArenaAllocator, // allocations that live as long as the model
-@@ -110,6 +132,7 @@ pub const Model = struct {
+@@ -114,6 +136,7 @@ pub const Model = struct {
      rd: round.Round,
      graphs: ?round.Graphs = null,
      pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
@@ -575,7 +576,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
      dpool: ?draft.Pool = null,
      dr: ?draft.Drafter = null,
      tables: ?engram_io.Tables = null,
-@@ -188,6 +211,7 @@ pub const Model = struct {
+@@ -194,6 +217,7 @@ pub const Model = struct {
          m.t_enqueue = 0;
          m.t_forward = 0;
          m.t_absorb = 0;
@@ -583,7 +584,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
          m.dpool = null;
          m.dr = null;
          m.tables = null;
-@@ -276,11 +300,10 @@ pub const Model = struct {
+@@ -291,11 +315,10 @@ pub const Model = struct {
          m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
          errdefer m.ex.unload();
  
@@ -598,7 +599,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
          m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
          errdefer m.rope_buf.free();
          {
-@@ -289,7 +312,12 @@ pub const Model = struct {
+@@ -304,7 +327,12 @@ pub const Model = struct {
              for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
                  var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
                  defer f.close(io);
@@ -612,7 +613,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
                  try m.rope_buf.upload(j * part.len, part);
              }
          }
-@@ -326,9 +354,14 @@ pub const Model = struct {
+@@ -342,9 +370,14 @@ pub const Model = struct {
              const sh = try shard.Shard.init(o.rank, o.world, pool, round.max_rows);
              m.kvs = .{ .sh = sh, .mode = mode, .k = try shard_ops.Kernels.load(d, cuda.kernels.dsv41_shard) };
              m.eng.kv = &m.kvs.?;
@@ -630,7 +631,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
          m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
          errdefer m.blas.close();
          m.eng.blas = &m.blas;
-@@ -465,6 +498,47 @@ pub const Model = struct {
+@@ -484,6 +517,47 @@ pub const Model = struct {
          return .{ .mode = mode, .pool = pool, .window = window };
      }
  
@@ -678,7 +679,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
      /// The start-up's note of what it serves when the pool is not the window or the shard is on: the pool, its parts,
      /// the single-conversation limit (below the window asked: said so, with the numbers), the compressed planes'
      /// bytes a rank (calculated: rows by the formula; the arena's figure is the measured one).
-@@ -520,6 +594,7 @@ pub const Model = struct {
+@@ -539,6 +613,7 @@ pub const Model = struct {
          m.blas.close();
          if (m.kvs) |*x| x.k.unload();
          m.arena.deinit();
@@ -686,7 +687,7 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
          m.rope_buf.free();
          m.ex.unload();
          m.ops.unload();
-@@ -1376,3 +1451,29 @@ test "pickWindow: --context wins and must match TF_DS_WINDOW; a follower takes T
+@@ -1409,3 +1484,29 @@ test "pickWindow: --context wins and must match TF_DS_WINDOW; a follower takes T
      try std.testing.expectEqual(@as(?usize, 2101248), try Model.pickWindow(null, 2101248, "9999999")); // never past the pool
      try std.testing.expectEqual(@as(?usize, null), try Model.pickWindow(null, 2101248, null));
  }
@@ -717,10 +718,10 @@ index 62b939ae6141ec318e423f419cef37b6d1d86b4b..e3864c83b6dd02c434b6107389ac4ca3
 +    try std.testing.expectEqual(@as(usize, 0), maxRopeWindow(10, R));
 +}
 diff --git a/zig/src/families/dsv41/prompt.zig b/zig/src/families/dsv41/prompt.zig
-index 959ad6592b340c632504d8405285063308da5084..72455d8de332edc8ad20105009451780d3cf6b66 100644
+index 9a0f7e1d846bd8e4d7aabf4b0cac5af9838fbab2..d1fa9a9fb49e6679b5be12a4a4c4ae00e8e95e1e 100644
 --- a/zig/src/families/dsv41/prompt.zig
 +++ b/zig/src/families/dsv41/prompt.zig
-@@ -632,28 +632,59 @@ pub const Caches = struct {
+@@ -700,28 +700,59 @@ pub const Caches = struct {
      }
  
      fn initParts(e: *const Engine, a: *Arena, cap: usize, slots: usize, sh: ?shard.Shard) !Caches {
@@ -788,9 +789,9 @@ index 959ad6592b340c632504d8405285063308da5084..72455d8de332edc8ad20105009451780
      /// Rows of a ratio-`r` source's compressed codes (and scales) on this rank: the pool's and two, or sharded its
      /// part's, two and the trash rows.
      pub fn compRows(cs: *const Caches, r: usize) usize {
-@@ -1638,3 +1669,83 @@ fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
-     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
-     return error.NotPortedYet;
+@@ -1786,3 +1817,83 @@ test "the indexer's row blocks are whole 16-row multiples, so every block's view
+     // a chunk that fits in one block is one block, whatever its size
+     try std.testing.expectEqual(@as(usize, 100), indexRowBlock(100, 10));
  }
 +
 +/// An Engine with only the config and the layers' shapes (Caches.layout's host-side reading), for placement tests.

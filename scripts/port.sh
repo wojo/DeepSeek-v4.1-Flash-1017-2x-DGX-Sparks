@@ -189,6 +189,10 @@ port_validate() {
   fi
   [[ -z "$KV_SHARD_DECODE" || "$KV_SHARD_DECODE" =~ ^(fetch|owner)$ ]] || die "KV_SHARD_DECODE is fetch, owner or empty, not $KV_SHARD_DECODE"
   [[ -z "$KV_SHARD_DECODE" || "$KV_SHARD" == 1 ]] || warn "KV_SHARD_DECODE=$KV_SHARD_DECODE does nothing without KV_SHARD=1"
+  # Robert's fork: with KV_SHARD=1 the engine runs every prompt pass whole (0018), so TF_FILL_* gives no pieces or
+  # cut-ins, and TF_FILL_CHUNKS also turns 0005's interleave off (lane_host.zig interleaving()): worse than not setting it
+  [[ "$KV_SHARD" != 1 || -z "${TF_FILL_CHUNKS:-}${TF_FILL_CUT_IN:-}${TF_FILL_FIRST:-}${TF_FILL_ROUNDS:-}" ]] ||
+    warn "TF_FILL_* does nothing with KV_SHARD=1 (every prompt pass runs whole), and TF_FILL_CHUNKS also turns PREFILL_INTERLEAVE_MS off: unset them, or set KV_SHARD=0 for short prompts cutting in"
   [[ "$KV_SHARD_CARRY" =~ ^[01]$ ]] || die "KV_SHARD_CARRY is 0 or 1, not $KV_SHARD_CARRY"
   [[ "$KV_SHARD_TWINS" =~ ^[01]$ ]] || die "KV_SHARD_TWINS is 0 or 1, not $KV_SHARD_TWINS"
   [[ "$KV_SHARD_CHECK" =~ ^[0-9]{1,18}$ ]] || die "KV_SHARD_CHECK is a count of decode rounds (0: at start only), not $KV_SHARD_CHECK"
@@ -568,6 +572,61 @@ port_spill_check() {
   if ! port_spill_judge 1 "$(worker_host 1)" "$line"; then port_spill_default_off "$PORT_SPILL_WHY"; return 0; fi
   log "Spill tier: $SPILL_GIB GiB a Spark, floor $SPILL_FLOOR_GIB GiB, quota ${SPILL_QUOTA_GIB} GiB; rank 0 ${PORT_SPILL_REAL[0]}, rank 1 ${PORT_SPILL_REAL[1]}"
 }
+# engram_listing <dir>: what the engine's rank fingerprint reads from an Engram folder — every regular file at its top
+# as name:size;, sorted, symlinks skipped (zig/patches/0016, fingerprint.zig listing(): `if (e.kind != .file) continue`).
+# A HF snapshot holds symlinks into blobs/, so it lists nothing. Portable: stat -c on Linux, -f on BSD.
+engram_listing() {
+  local d=$1 f n s out=""
+  [[ -d "$d" ]] || return 1
+  for f in "$d"/*; do
+    [[ -e "$f" ]] || continue
+    [[ -L "$f" ]] && continue
+    [[ -f "$f" ]] || continue
+    n=${f##*/}
+    s=$(stat -c %s "$f" 2>/dev/null) || s=$(stat -f %z "$f" 2>/dev/null) || return 1
+    out+="$n:$s;"$'\n'
+  done
+  printf '%s' "$out" | LC_ALL=C sort
+}
+
+# head_engram_dir: rank 0's Engram folder as a path on this Spark: HEAD_ENGRAM_DIR, else the HF snapshot the container
+# reads as /hf/hub/models--<engram>--<rev>/snapshots/<rev> (engram_in_container, scripts/config.sh).
+head_engram_dir() {
+  if [[ -n "${HEAD_ENGRAM_DIR:-}" ]]; then echo "$HEAD_ENGRAM_DIR"; return 0; fi
+  local c
+  c=$(engram_in_container 2>/dev/null) || return 1
+  [[ -n "$c" && "$c" == /hf/* ]] || return 1
+  echo "${HF_CACHE}${c#/hf}"
+}
+
+# port_engram_check: with the spill tier on, both ranks must list the same Engram files, because the engine's rank
+# fingerprint compares exactly that (0016: revision | digest(kit/engram.json) | listing(engram dir)). Rank 0 reads
+# HEAD_ENGRAM_DIR, else the HF snapshot — whose entries are symlinks into blobs/, which listing() skips, so it lists
+# nothing while the worker's copied folder lists its files: the pair then refuses to load with FingerprintMismatch in
+# engram (issue #61), and only after the running server has been stopped. Checked here, before anything is stopped.
+# Silent when a folder is not there yet (prepare.sh writes both); KV sharding alone is not affected (its shard
+# agreement marks engram "shard-only", 0018).
+port_engram_check() {
+  port_spill_on || return 0
+  local head hlist wlist snap fix shards="" s
+  head=$(head_engram_dir) || return 0
+  hlist=$(engram_listing "$head") || return 0
+  if [[ -n "${WORKER_DOWN[1]:-}" ]]; then
+    warn "DRY_RUN: $(worker_host 1) cannot be reached: its Engram folder is not compared with rank 0's"
+    return 0
+  fi
+  if ! wlist=$(worker 1 "$(declare -f engram_listing); engram_listing \"$WORKER_ENGRAM_DIR\" || echo __NO_DIR__"); then
+    warn "could not compare $WORKER_ENGRAM_DIR on $(worker_host 1) with rank 0's Engram folder ($head)"
+    return 0
+  fi
+  [[ "$wlist" == __NO_DIR__ ]] && return 0
+  [[ "$hlist" == "$wlist" ]] && return 0
+  snap="$HF_CACHE/hub/models--${ENGRAM_ID//\//--}/snapshots/$(engram_rev)"
+  fix="$HOME/.cache/dsv41-tensorfold/engram-$(engram_rev | cut -c1-8)"
+  for s in $ENGRAM_SHARDS; do shards+=" $snap/$s"; done
+  die "the ranks' Engram folders list different files, and the engine's rank fingerprint compares exactly that (the revision, the kit's engram.json and the folder's regular files by name and size; symlinks are skipped). rank 0 ($head) lists [$(printf '%s' "$hlist" | tr '\n' ' ')], rank 1 ($(worker_host 1), $WORKER_ENGRAM_DIR) lists [$(printf '%s' "$wlist" | tr '\n' ' ')]. With SPILL_GIB on and HEAD_ENGRAM_DIR empty, rank 0 reads the HF snapshot, whose entries are symlinks into blobs/ and so list nothing: put the same files on this Spark's disk and point HEAD_ENGRAM_DIR at that folder (hardlinks, no extra disk) — mkdir -p $fix && cp -lL $snap/config.json $snap/model.safetensors.index.json$shards $fix/ && echo \"HEAD_ENGRAM_DIR=$fix\" >> scripts/local.sh — then run ./start.sh restart (issue #61). Nothing was stopped."
+}
+
 # NFS_PATH when it is a real path ("/" is an NFSv4 pseudo-root, not a folder of this Spark)
 port_nfs_path() { [[ "$NFS_PATH" == / ]] || echo "$NFS_PATH"; }
 

@@ -75,7 +75,7 @@ declare -A ENGRAM_SHARD_SIZE=([model-00047-of-00048.safetensors]=101535150936 [m
 # The engine: BertholomusAI's TensorFold fork, branch deepseek-v41-zig (the DeepSeek-V4.1-Flash family on TensorFold's
 # native Zig engine, two nodes), at the head of that branch; it serves both ranks.
 TF_REPO="${TF_REPO:-https://github.com/bertholomus/TensorFold.git}"
-TF_REF="${TF_REF:-629c524a0ea57512a5342abb498d1b7c25353343}"   # the branch tip of 2026-10-19 (was 3ff3b2ac; docs/zig-engine.md, "The pin")
+TF_REF="${TF_REF:-fbbc97132cd004237d9887b8d3185896efaedc5c}"   # the branch tip of 2026-10-23 (was 629c524a; docs/zig-engine.md, "The pin")
 # The inputs' tools: the same fork's branch deepseek-v41-zig-tp4, at the commit of the four-node recipe v0.1.1. It adds
 # what the two-node branch lacks: tf-dsv41-rank-cache (a rank's weight file from the checkpoint alone, no GPU, no
 # Python) and the standalone token-map and RoPE-table scripts. Only those are taken; it does not serve here.
@@ -124,7 +124,7 @@ CONTEXT="${CONTEXT:-1048576}"
 # zig/patches/0008: the positions the streams' extents and kept prompts share (rank 0's and rank 1's --pool), when more than CONTEXT: more
 # long prompts stay resident (each kept prompt holds its extent) and more long requests run at once. Empty (default): CONTEXT, as before.
 # It may not be smaller than CONTEXT. Its KV caches grow with it (about 0.9 GiB a rank per 1,048,576 positions, in host memory: measure the
-# head's headroom first, see README); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
+# head's headroom first, see docs/memory-and-safety.md); the RoPE tables stay the window's size. TF_DS_POOL, and TF_DS_WINDOW (= CONTEXT) on both ranks.
 # With KV_SHARD=1 (scripts/port.sh) the same POOL is cut into one part a Spark, each holding a whole CONTEXT window, and each Spark
 # keeps only its own part's compressed KV: about half the KV memory a Spark for the same POOL (measured at 2,101,248 positions:
 # 1,062 MiB a rank against 1,783 MiB replicated; decode 1-4% slower). Empty with KV_SHARD=1: the pool it needs (2,101,248 at 1,048,576).
@@ -154,6 +154,10 @@ RDMA="${RDMA:-1}"
 RDMA_IDLE_S="${RDMA_IDLE_S:-2}"       # 0 to 3600 seconds
 RDMA_NAP_US="${RDMA_NAP_US:-500}"    # 1 to 1000000 microseconds; bounds wake and shutdown delay
 GRAPHS="${GRAPHS:-1}"
+# zig/patches/0033: with GRAPHS=1, the captured CUDA graphs each rank keeps at most; past it the least recently replayed
+# one is destroyed and captured again when it comes up. 0 keeps every one, as before 0033: they add up over days of
+# growing conversations (rows x context buckets x stretches) and are never freed (issue #69).
+GRAPH_CAP="${GRAPH_CAP:-128}"
 SIDE="${SIDE:-1}"
 PREFETCH="${PREFETCH:-1}"
 ENGRAM_AIO="${ENGRAM_AIO:-1}"
@@ -164,7 +168,7 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
-# Display-reserve KV (ezoushen's PR #9, zig/patches/0030-display-kv): the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb buffer on
+# Display-reserve KV (ezoushen's PR #9, zig/patches/0039-display-kv): the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb buffer on
 # DISPLAY_KV_CARD mapped into the GPU's address space), so their bytes leave the host's MemAvailable. MiB of it to use, whole steps
 # of 16, at most 2032; the tensors that fit go there (with KV_SHARD=1 this Spark's owner planes first), the rest stay on ordinary memory. 0: off. It needs no display
 # connected to the card (the engine checks); both ranks take it. TF_DS_DISPLAY_KV_MIB and TF_DS_DISPLAY_KV_CARD. The containers get the one
@@ -220,6 +224,9 @@ HEAD_NFS_SERVER="${HEAD_NFS_SERVER:-}"
 # Engram's tables on this Spark's own disk (a folder with the base model's shards 47 and 48, as WORKER_ENGRAM_DIR is on the worker),
 # mounted into rank 0 at /engram. Without it rank 0 reads them from HF_CACHE: over NFS a random 4 KiB read took 942 us here
 # against 90 us from the worker's local copy, and a decode round or a prefill chunk makes many of them. Empty: HF_CACHE.
+# With the spill tier on, the engine's rank fingerprint compares this folder's regular files with the worker's (name and
+# size; symlinks are skipped), so leaving it empty makes rank 0 list nothing against WORKER_ENGRAM_DIR's files and the
+# pair refuses to load with FingerprintMismatch in engram (start.sh's port_engram_check; issue #61).
 HEAD_ENGRAM_DIR="${HEAD_ENGRAM_DIR:-}"
 HEAD_NFS_VOLUME="${HEAD_NFS_VOLUME:-dsv41-hf-head}"
 
@@ -287,10 +294,26 @@ served_in_container() { echo "/hf/$DATA_SUB/model"; }
 # What scripts/prepare.sh last left ready (start.sh runs it again when this line changes). "+stock-dtypes": an overlay
 # checkpoint prepared before scripts/ablit_stock_dtypes.py gets that step on the next start.
 PREPARED_MARKER="$STATE_DIR/prepared"
+# Every field is quoted (printf %q), so a value holding another field's text cannot shift into it, and the template's
+# sha256 is part of it (a changed model/chat_template.jinja is served only after prepare.sh linked it again). It fails
+# (status 1, a message) when the template cannot be hashed: a state that cannot be computed never reads as ready.
 prepared_state() {
-  echo "model=$MODEL_ID@$(snapshot_rev) engram=$ENGRAM_ID@$(engram_rev) image=$(image_ident "$IMAGE") kit=$KIT_REF" \
-       "w=$(worker_host 1) wengram=$WORKER_ENGRAM_DIR wcache=$WORKER_CACHE_DIR ablit=$ABLIT" \
-       "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+  local i tpl f
+  tpl=$(sha256sum "$_cfg_root/model/chat_template.jinja" | cut -c1-64) && [[ -n "$tpl" ]] ||
+    die "cannot hash model/chat_template.jinja (sha256sum)"
+  f=("model=$MODEL_ID@$(snapshot_rev)" "engram=$ENGRAM_ID@$(engram_rev)" "image=$(image_ident "$IMAGE")" "kit=$KIT_REF"
+     "w=$(worker_host 1)" "wengram=$WORKER_ENGRAM_DIR" "wcache=$WORKER_CACHE_DIR" "ablit=$ABLIT"
+     "overlay=$( [[ "$ABLIT" == 1 ]] && echo "$ABLIT_ID@$ABLIT_REVISION+stock-dtypes" || echo none)"
+     "hf=$HF_CACHE" "nfs_path=$NFS_PATH" "nfs_volume=$NFS_VOLUME" "template=$tpl")
+  for i in 2 3; do [[ -z "$(worker_host "$i")" ]] || f+=("w$i=$(worker_host "$i")"); done
+  for i in 1 2 3; do f+=("nfs$i=$(wval NFS_SERVER "$i")"); done
+  (export LC_ALL=C; printf '%q ' "${f[@]}"; echo)   # (a subshell: the caller's locale is left as it was)
+}
+# prepare.sh's last step: computed first and swapped in whole, so a failure leaves the previous marker as it was
+write_prepared_marker() {
+  local state
+  state=$(prepared_state) || return 1
+  printf '%s\n' "$state" > "$PREPARED_MARKER.new" && mv -f "$PREPARED_MARKER.new" "$PREPARED_MARKER"
 }
 
 # ---------------------------------------------------------------- API key

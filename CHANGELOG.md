@@ -2,10 +2,97 @@
 
 ## Unreleased
 
-- Fork main rebuilt on upstream `27741e1`: display reserve follows upstream patches 0024–0029 as
-  `0030-display-kv.patch`; spill, KV sharding and display fallback defaults are retained. Engine patch export now
-  requires an explicit `--base` containing all current patches; the old display-only engine base lacks the new upstream fixes.
-
+- README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
+  unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
+  `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
+- `zig/patches/0035-engram-lead-failure-paths.patch` (always on): Engram prompt reads fail safely with
+  `TF_DS_ENGRAM_LEAD` and without it. A read that fails on one rank only (a disk or memory fault) left that rank out of
+  the layer's collective while the other waited in it; it now ends the pair (`EngramRankFault`, status 75 for the
+  supervisor to restart both ranks). A table shorter than the hasher's row range is refused at start, the follower
+  joins its Engram readers on every exit, an AIO allocation failure records no batch, and `Model.open`, `Pool.init` and
+  `Tables.open` release what they made on failure. A read failure on both ranks now restarts the pair too, instead of
+  failing one request. By **Hector Isaza ([hecisaza](https://github.com/hecisaza))**.
+- The engine pin moves to `fbbc971` (BertholomusAI's `deepseek-v41-zig` tip of 2026-10-23, was `629c524`), with the
+  series rebased onto it: `0002` and `0006` are gone (the engine's `TF_DS_ENGRAM_LEAD` and `3de79d8` do their jobs),
+  twelve patches are adapted to the engine's prompt pass in pieces (`TF_FILL_CHUNKS`, `TF_FILL_CUT_IN`; `start.sh` passes
+  `TF_FILL_*`), and `0034` holds two follow-ups. Details in `zig/patches/README.md`. By **eleata**.
+  Three behaviour changes come with the pin even with every switch off: a DSML call to a tool the request did not
+  offer is now returned as a `tool_calls` entry under the model's own name (`tool_parse.zig`, as #67 asks), so a client
+  that runs call names without checking them against its own tool list should check them; the prompt cache's `tail`
+  rule passes over a kept state within the window's rows of the prompt's end (`prompt_cache.zig` `find`); and prompts
+  with pictures keep and resume states by default, keyed by the pictures' SHA-256 digests (`TF_DS_IMAGE_CACHE=0` turns
+  it off). Also from the engine: a malformed `TF_FILL_*` value is ignored silently (the pass then runs whole), and
+  `TF_DS_SOLO_OVERHEAD` / `TF_DS_NO_COPIES` count as on for any set value other than `0`, an empty one included.
+- `zig/patches/0038-aligned-index-views.patch` (always on): the prompt pass's indexer scores rows in blocks, and a block
+  size that was not a multiple of 16 (137,612 compressed keys gave 121-row blocks) put a later block's views off the
+  16-byte boundary the kit's kernels were captured for: no matching variant, `MissingTritonVariant`. Blocks are now a
+  multiple of 16 rows (a row's scores are its own: no bits change), and a replay cut with an odd first row copies the
+  positions to an aligned buffer. From the 4x recipe's `0005` and `0007` (Mia's AI Lab), carried onto the `fbbc971` pin;
+  a host test for the block size. It may be related to #65 and #36, but that is not shown.
+- `zig/patches/0037-rendezvous-ports-early.patch` (on): rank 0 opens its follower's port before its weights load and takes
+  the connection afterwards. It used to listen only after its own weights had loaded, while the worker retried its
+  connect for a fixed 300 s, so a worker that finished loading more than 300 s before the head (the head reading its
+  weights cold, say) exited with `ConnectFailed`; now it waits in the port's backlog. `TF_DS_CONNECT_S` (default 300)
+  sets that retry window on both ranks; `start.sh` refuses a value that is not 1 to 86400. Host tests: a peer that
+  connects before the accept (also through `Fan`) is linked once rank 0 takes its port, and the setting's parsing; a
+  `scripts/port_test.sh` check that it reaches both ranks. After the 4x recipe's `0035` (Mia's AI Lab), which found it
+  there (its issue #3, diagnosed by shanedertrain).
+- `zig/patches/0036-metrics-cached-prompt-tokens.patch` (always on, issue #58): `/metrics` publishes
+  `prompt_tokens_cached_total`, the prompt tokens of finished requests restored from kept prompt states (they are in
+  `prompt_tokens_total` too), repeated under vLLM's `prefix_cache_hits_total` / `prefix_cache_queries_total`; `/health`
+  carries `prompt_tokens_total`, `cached_tokens_total` (the name sparkDash reads) and `generation_tokens_total`, read
+  together with the `/metrics` counters so a scraper never subtracts a cached count from another moment's prompt count;
+  `/v1/models` names `max_model_len` (the context window; sparkDash's Context tile reads it). Computed prompt tokens
+  are `prompt_tokens_total - cached_tokens_total`. Counters are left out for an engine that keeps no prompt states. The
+  counter and its vLLM names are by **manuel1618 ([manuel1618](https://github.com/manuel1618))**
+  ([pull request #8](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/8) of the 4x recipe, a backport of the TensorFold commit `ce0d9053` by juliankang4), adapted here with
+  `/health` and `/v1/models` added; host tests in `zig/src/server/status_totals_test.zig` and `metrics.zig`.
+- `./stop.sh` exits 1 when a rank could not be stopped or a Spark's containers could not be listed (ssh or `docker ps`
+  failed), and says which Spark it left alone. Before, such a Spark counted as having no container, stop.sh exited 0,
+  and `./start.sh restart` went on to launch a rank while the old one might still hold the GPU's memory. The prepared
+  marker (`scripts/config.sh`, `prepared_state`) now covers the chat template's sha256, `HF_CACHE`, `NFS_PATH`,
+  `NFS_VOLUME` and each `NFS_SERVER`, quotes every field, is swapped in whole, and a state that cannot be computed
+  (the template cannot be hashed) stops `start.sh` instead of comparing equal to a missing marker, which read as "ready".
+  The marker's text changes: the next `./start.sh` on a running pair asks for one `./start.sh restart`. By **[SvangenStudios](https://github.com/SvangenStudios)**
+  ([pull request #4](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/4) of the 4x recipe), adapted to two ranks; offline tests `scripts/test_scripts.py`
+  (fake `ssh` and `docker`, no Spark): 22 of 26 fail on the previous scripts.
+- `tools/validate.py` passes a check only on a real completion: an HTTP error, an `error` object, a reply that is not
+  the assistant's, a tool call without an id, a function name or JSON-object arguments, and a short, empty or non-list
+  `--compare` reference now fail with a message instead of passing or crashing, and an option without a value stops with
+  one. By **[SvangenStudios](https://github.com/SvangenStudios)** ([pull request #5](https://github.com/MiaAI-Lab/DeepSeek-V4.1-Flash-1017-4x-DGX-Sparks-TensorFold/pull/5) of the 4x recipe, without its `TF_DEBUG_PROMPT_FILE` option);
+  offline tests `tools/test_validate.py` (a mock server, 28 tests; 31 checks fail on the previous script).
+- `zig/patches/0030-anthropic-context-management-lenient.patch` (always on): the Anthropic frontend accepts any
+  `clear_thinking_<date>` edit in `context_management` with any `keep`. It accepted only `clear_thinking_20251015` with
+  `keep: "all"`, so a client that clears earlier thinking when the user sends a message mid-conversation (the original
+  `clear_thinking_20250929` with `keep: "none"`, which the cloud API takes) got a non-retryable 400. Other edit types are
+  still refused. By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #71](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/71); a host test in `late_system_test.zig`.
+- `zig/patches/0031-anthropic-system-anywhere.patch` (always on): a `system` turn inside `messages` is accepted anywhere,
+  as on the cloud API. It had to follow a user or system turn and precede an assistant turn or the end, so a client that
+  injects a reminder before the newest user turn got a 400; turn-scoped `clear_at` and per-message `output_config` are
+  still refused. By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #72](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/72); the placement assertion in `late_system_test.zig` now
+  expects the new behaviour.
+- `zig/patches/0032-stream-keepalive-ping.patch` (always on): while a streaming reply waits for the engine and nothing has
+  been sent for 25 s, it sends a keep-alive (`event: ping` on Messages, a `: ping` comment on the OpenAI frontends), so a
+  proxy that closes an idle stream at about 126 s no longer cuts a long cold prefill. Replies are unchanged; a warm
+  prompt sends no ping. By **Maciej Kowalik ([koniaik](https://github.com/koniaik))**, [pull request #76](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/76), measured on a pair behind such a proxy.
+- `zig/patches/0033-graph-cap.patch` (on, `GRAPH_CAP=128`): the CUDA graph cache keeps at most `GRAPH_CAP` captured
+  stretches a rank and destroys the least recently replayed one past it (issue #69). Before, every graph stayed until
+  the process ended, so both ranks' device and host memory grew for days with growing conversations until memguard
+  killed rank 0. Replies are unchanged (`tools/exact.py` 31/31 with an eviction almost every stretch) and decode at the
+  default equals uncapped graphs; `GRAPH_CAP=0` keeps the old behavior. `scripts/port_test.sh` checks that both ranks
+  get the setting. By **E-Zou Shen ([ezoushen](https://github.com/ezoushen))**, [pull request #70](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/70);
+  renumbered 0031 to 0033.
+- `start.sh` compares the two ranks' Engram folders before anything is stopped when the spill tier is on
+  (`port_engram_check`, `scripts/port.sh`). The engine's rank fingerprint covers the folder's regular files by name and
+  size (`zig/patches/0016`, `fingerprint.zig`'s `listing()`), and a Hugging Face snapshot holds symlinks into `blobs/`:
+  with the default empty `HEAD_ENGRAM_DIR` rank 0 listed nothing against the worker's four files, so the pair refused
+  to load with `FingerprintMismatch` in `engram` — after the running server had already been stopped (issue #61). The
+  check refuses before the stop, naming both listings and the fix (`HEAD_ENGRAM_DIR` on a local folder holding the same
+  files, hardlinked: no extra disk, and rank 0 then reads Engram locally); it stays silent while a folder is not there
+  yet, warns when the worker cannot be reached, and does nothing with the tier off (KV sharding alone marks `engram`
+  `shard-only`, `0018`). `scripts/port_test.sh` covers the listing, the refusal and its message, both silent paths and
+  the warning. By **Qingchen Yu ([markyu0401](https://github.com/markyu0401))**,
+  [pull request #64](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/64).
 - `ABLIT=1` on a read-only Hugging Face blob cache: `prepare.sh` gives the overlay's work folder its own writable copy of
   the checkpoint index (the shards stay hard links), so the graft no longer fails with `PermissionError` when it rewrites
   the index (issue #42, reported by unitea1992). By **Robert Wojciechowski ([wojo](https://github.com/wojo) on GitHub,
@@ -44,22 +131,6 @@
   before: 0 of 3, each diverging right before the calls), and the non-streamed reply's turn sent back as returned does
   too. Reply ids are unchanged (greedy, seeded temperature 1, thinking, a tool call, a 10K-token prompt). A streamed
   paragraph break now waits for the next token before it is sent. By **[Coinupbtc](https://github.com/Coinupbtc)**, [pull request #44](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/44) (sent as `0012`).
-- **Robert's defaults (this fork's `main` only):** `SPILL_GIB=64`, `KV_SHARD=1` and the display reserve at
-  `DISPLAY_KV_MIB=1792` on by default, an empty `POOL` derived as 5,218,304 with the reserve (2,101,248 without). Every
-  default degrades: a failing spill folder, a connected display or missing card on either Spark (checked before anything
-  is stopped), or a reserve the engine cannot map at load (one restart without it) starts without that feature, with a
-  warning; explicit settings still refuse.
-
-- Display-reserve KV, `DISPLAY_KV_MIB` / `DISPLAY_KV_CARD` (off by default; headless GB10 only), by **ezoushen**
-  ([pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9), its patch `0007-display-kv` ported as
-  `zig/patches/0030-display-kv.patch`): the KV caches on the framebuffer the UEFI reserves, so their bytes leave the host's `MemAvailable`
-  (the GLM-5.3-Flash recipe's display-KV idea). With `KV_SHARD=1` each Spark puts its own part's compressed planes (the owner rows) there first and
-  the replicated index keys and raw stores after them; each rank logs at start how many MiB went to the reserve and how many to normal memory.
-  Measured in #9 on the stock recipe (replicated KV, 893 MiB a rank, all of it on the framebuffer): the head's idle `MemAvailable` went from
-  6.76 to 7.49 GiB and its lowest during a cold 96K-token prompt from 5.89 to 7.12 GiB (worker: 8.63 to 9.22 and 8.60 to 9.19); `tools/exact.py`
-  31 of 31 cases identical with it on and off. Measured on this pair with the port's sharded pool: at `POOL=5218304` with `DISPLAY_KV_MIB=1792` each rank put 1,791 MiB (all of its owner planes) on the reserve and 852 MiB in normal memory; `tools/exact.py` 39 of 39 identical; the lowest `MemAvailable` during a 227,640-token prompt was 6.57 / 8.32 GiB, against 6.44 / 8.22 GiB for 2,101,248 positions without the reserve. The engine now also refuses at start, with the numbers,
-  a window its RoPE tables (1,114,112 positions) do not cover; a stream's positions are its own, so a larger `POOL` never needs longer tables.
-
 - **Rank 0's memory with long prompts:** `zig/patches/0023-server-prepare-memory.patch`, a fix to the base engine after
   the port's series (also offered alone as its own pull request). A prompt's render and tokenization kept their scratch
   in the request's memory until the reply ended: a resumed ~948K-token conversation held ~1.3-1.5 GB on rank 0, and

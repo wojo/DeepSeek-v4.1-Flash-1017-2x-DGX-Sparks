@@ -266,7 +266,7 @@ is the procedure for that checkout (a new tree from this branch beside the old o
 unit; rolled back by swapping back). The steps below are the general ones for a checkout that serves directly.
 
 1. **Engine branch ready.** Engine work after the series (a branch on top of the one `zig/patches` reproduces:
-   a base containing all current patches, including upstream 0024–0029 and display reserve 0030) checked as `PORT.md` asks (host tests, the Linux cross-build;
+   a base containing all current patches, including upstream 0024–0038 and display reserve 0039) checked as `PORT.md` asks (host tests, the Linux cross-build;
    GPU checks on the pair by the coordinator). With nothing after the series, go on at step 3.
 2. **Export.** `scripts/port-patches.sh --base <engine base> --branch <engine branch> --dry-run`, then without `--dry-run`; commit
    `zig/patches` on the recipe branch.
