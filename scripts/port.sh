@@ -189,10 +189,6 @@ port_validate() {
   fi
   [[ -z "$KV_SHARD_DECODE" || "$KV_SHARD_DECODE" =~ ^(fetch|owner)$ ]] || die "KV_SHARD_DECODE is fetch, owner or empty, not $KV_SHARD_DECODE"
   [[ -z "$KV_SHARD_DECODE" || "$KV_SHARD" == 1 ]] || warn "KV_SHARD_DECODE=$KV_SHARD_DECODE does nothing without KV_SHARD=1"
-  # Robert's fork: with KV_SHARD=1 the engine runs every prompt pass whole (0018), so TF_FILL_* gives no pieces or
-  # cut-ins, and TF_FILL_CHUNKS also turns 0005's interleave off (lane_host.zig interleaving()): worse than not setting it
-  [[ "$KV_SHARD" != 1 || -z "${TF_FILL_CHUNKS:-}${TF_FILL_CUT_IN:-}${TF_FILL_FIRST:-}${TF_FILL_ROUNDS:-}" ]] ||
-    warn "TF_FILL_* does nothing with KV_SHARD=1 (every prompt pass runs whole), and TF_FILL_CHUNKS also turns PREFILL_INTERLEAVE_MS off: unset them, or set KV_SHARD=0 for short prompts cutting in"
   [[ "$KV_SHARD_CARRY" =~ ^[01]$ ]] || die "KV_SHARD_CARRY is 0 or 1, not $KV_SHARD_CARRY"
   [[ "$KV_SHARD_TWINS" =~ ^[01]$ ]] || die "KV_SHARD_TWINS is 0 or 1, not $KV_SHARD_TWINS"
   [[ "$KV_SHARD_CHECK" =~ ^[0-9]{1,18}$ ]] || die "KV_SHARD_CHECK is a count of decode rounds (0: at start only), not $KV_SHARD_CHECK"

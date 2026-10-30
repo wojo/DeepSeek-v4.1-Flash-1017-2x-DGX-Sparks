@@ -168,6 +168,13 @@ REPLAY_FLOOR="${REPLAY_FLOOR:-1}"
 # rounds for the streams already live (and to their cancels): TF_DS_PREFILL_INTERLEAVE_MS, read by rank 0 only. 0: the pass runs to
 # its end first, as before. 250 is what PR #5 and this recipe measured. Each such stop costs the long prompt about the time given.
 PREFILL_INTERLEAVE_MS="${PREFILL_INTERLEAVE_MS:-250}"
+# The engine's prompt pass in pieces (TF_FILL_*, read by rank 0's server; start.sh passes every exported TF_FILL_*): the
+# live streams get TF_FILL_ROUNDS rounds (default 4) between two pieces of TF_FILL_CHUNKS chunks of 2,048 tokens (the
+# first piece TF_FILL_FIRST chunks, so a prompt that short runs whole), and a prompt of at most TF_FILL_CUT_IN tokens runs
+# between two pieces of a long one instead of waiting for it. With TF_FILL_CHUNKS set, 0005's interleave is off (the
+# pieces do its job). Robert's fork: on by default, with KV sharding too (zig/patches/0042-kv-shard-pieces); set
+# TF_FILL_CHUNKS=0 in local.sh to run every pass whole (PREFILL_INTERLEAVE_MS then applies again).
+export TF_FILL_CHUNKS="${TF_FILL_CHUNKS:-1}" TF_FILL_FIRST="${TF_FILL_FIRST:-4}" TF_FILL_CUT_IN="${TF_FILL_CUT_IN:-8192}"
 # Display-reserve KV (ezoushen's PR #9, zig/patches/0039-display-kv): the KV caches on the framebuffer a headless GB10 reserves (UEFI, about 1.75 GiB a GPU; a DRM dumb buffer on
 # DISPLAY_KV_CARD mapped into the GPU's address space), so their bytes leave the host's MemAvailable. MiB of it to use, whole steps
 # of 16, at most 2032; the tensors that fit go there (with KV_SHARD=1 this Spark's owner planes first), the rest stay on ordinary memory. 0: off. It needs no display
