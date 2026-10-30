@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **This fork (Robert's `main`)**, on top of Mia's main `0e7d421`: ezoushen's display reserve ([pull request #9](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/9)) as
+  `zig/patches/0039-display-kv.patch` (was `0030`; re-anchored on the `fbbc971` pin: one import line in `model.zig` and
+  its placement test at the end of `prompt.zig`, the code unchanged), and Robert's defaults: `SPILL_GIB=64`, `KV_SHARD=1`,
+  `DISPLAY_KV_MIB=1792`, an empty `POOL` derived as 5,218,304, each degrading where it cannot run. `scripts/port.sh` warns
+  when `TF_FILL_*` is set with `KV_SHARD=1`: the engine runs every prompt pass whole under sharding (`0018`), so the
+  switches give no pieces or cut-ins there, and `TF_FILL_CHUNKS` would also turn `0005`'s interleave off.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,
   `spill-and-kv-sharding.md`, `abliterated.md` and `measurements.md` (which now records the 29 October 2026 checks on the current image).
