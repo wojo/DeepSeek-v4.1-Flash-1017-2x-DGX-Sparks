@@ -8,10 +8,10 @@ and anything on the Sparks is the coordinator's: these are the steps it runs. No
 
 | | |
 | --- | --- |
-| unit | `deepseek1017.service` (oneshot, `RemainAfterExit=yes`, `TimeoutStartSec=7200`), enabled; `deepseek1017-watchdog.timer` restarts it after 3 failed `/health` checks, never while `~/.deepseek1017-hold` exists |
-| drop-in | `/etc/systemd/system/deepseek1017.service.d/fork.conf`: `WorkingDirectory`, `ExecStart` (`start.sh`), `ExecStartPost` (memguard from the fork dir) and `ExecStop` (`stop.sh`) point at **`~/DeepSeek-port`** |
+| unit | `deepseek1017.service`, enabled: since 2026-10-22 `Type=simple`, `FOREGROUND=1`, `PREPARE=0`, `Restart=on-failure`, `RestartSec=60s`, `StartLimitBurst=3` in 30 min (so the unit **never builds or prepares**: the image must be on both Sparks before a start), `ExecStartPre` waits for the worker; `deepseek1017-watchdog.timer` restarts it after 3 failed `/health` checks, never while `~/.deepseek1017-hold` exists |
+| drop-in | `/etc/systemd/system/deepseek1017.service.d/fork.conf`: `WorkingDirectory`, `ExecStart` (`start.sh`) and `ExecStop` (`stop.sh`) point at **`~/DeepSeek-port`**; `ExecStop` is resolved at stop time, so swap folders only while the unit is stopped |
 | fork checkout | `~/DeepSeek-port` on gx10-a: an earlier tree of this branch (or of the upstream `spill-kvshard`) with the fork's own `scripts/local.sh` |
-| image | `tensorfold-dsv41:exl3-tp2-99f490fc5c18` on both Sparks |
+| image | `tensorfold-dsv41:exl3-tp2-067553852da3` on both Sparks since 2026-10-30 (Mia's main `0e7d421` + display reserve `0039`); the previous `exl3-tp2-2cacfb08137a` stays for a rollback |
 | stock checkout | `~/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks`, untouched (the unit's own paths) |
 
 This branch already carries both local fixes of the stock tree (`compiler-mirror.patch`: `ZIG_MIRRORS`;
@@ -82,26 +82,45 @@ stays whole for a rollback.
 
    **Do not swap the folders unless it ends in `N of N checks passed` with every golden case `ok`** (a `skip
    golden` line or a `FAIL` stops the deploy; record the result in the deploy notes). Then
-   `DRY_RUN=1 ./start.sh restart` prints both ranks' docker
-   commands and changes nothing (the image tag in them is the new one: the patch hash changed). With spill on, check
+   `STATE_DIR=~/sess/dry-state DRY_RUN=1 PREPARE=0 FOREGROUND=1 ./start.sh restart` prints both ranks' docker
+   commands and changes nothing (its own `STATE_DIR`: the serving unit's start.sh holds `start.lock` for as long as it
+   serves, so a DRY_RUN on the shared state dies with 'another ./start.sh is already running') (the image tag in them is the new one: the patch hash changed). With spill on, check
    the identity variables (`TF_DS_ENGINE_ID`, `TF_DS_RECIPE_PATCHES`, `TF_DS_MODEL_REVISION`, `TF_DS_ENGRAM_REVISION`;
    `TF_DS_RANK_CACHE_SHA` appears once its digest is cached, after the first real start). A real start with spill on
    refuses (before stopping anything) when either rank's weight digest cannot be had: the digest names the store, so
    a rank without it would open an empty one. `SPILL_WEIGHTS_SHA=0` runs without digests on purpose, under another
    store name too.
 
-5. **Swap and restart through the unit** (it keeps owning the server):
+5. **The image first, then swap and start through the unit.** The unit runs `PREPARE=0`: a start whose image tag is
+   missing dies after `ExecStop` has already taken :8888 down, and `Restart=on-failure` repeats that into the start
+   limit. So put the new image (`source scripts/config.sh; echo $IMAGE` in the new tree) on both Sparks first:
+
+   - **Off the Sparks (what 2026-10-30 did; the Sparks keep serving):** on an arm64 Linux VM (podman), pull the base by
+     the digest the Sparks hold (`docker image inspect nvcr.io/nvidia/pytorch:26.07-py3` on gx10-a), then build with
+     `scripts/prepare.sh`'s exact `docker build` arguments (its step 2: `TF_REPO`, `TF_REF`, `INPUTS_REF`, `ZIG_*`,
+     `BASE_IMAGE`, `PATCHES_HASH=$(image_hash)`, the tag `$IMAGE`). `podman save --format docker-archive`, drop the
+     base's layer files from the archive (keep any the new layers also name) and `docker load` the ~0.6 GB rest on each
+     Spark: docker loads a layer from the archive only when its chain id is not in the store. Check the same image id
+     on both Sparks.
+   - **On gx10-a while :8888 is down:** `VERIFY_SHA=0 scripts/prepare.sh` in the new tree (~6 min of Zig, then the
+     copy to the worker). Not while serving: it needs memory the serving ranks do not leave.
+
+   Either way, first check the new image's `tf-dsv41-rank-cache <checkpoint> /tmp/x <rank> 2 --index-only | sha256sum |
+   cut -c1-20` against the existing `rank<r>of2-<hash>.bin` names (a VM run on a copy of the 39 shards' headers, the
+   tensor bytes left sparse, is enough): a different hash means `prepare.sh` must write ~106 GB a Spark before the start.
+   Then, in an idle moment (no `tensorfold:requests_running`/`_waiting` and no new requests for a minute):
 
    ```
-   mv ~/DeepSeek-port ~/DeepSeek-port.prev-$(date +%Y%m%d-%H%M) && mv ~/DeepSeek-port.next ~/DeepSeek-port
-   sudo systemctl restart deepseek1017.service       # ./stop.sh, then start.sh: prepare.sh builds the new image
-   journalctl -u deepseek1017.service -f              # ~6 min build + docker save | load to the worker, then the load
+   touch ~/.deepseek1017-hold
+   sudo systemctl stop deepseek1017.service
+   mv ~/DeepSeek-port ~/DeepSeek-port.prev-<old commit> && mv ~/DeepSeek-port.next ~/DeepSeek-port
+   S=~/.local/state/dsv41-tensorfold; cp -p $S/prepared $S/prepared.<old commit>
+   (cd ~/DeepSeek-port && bash -c 'source scripts/config.sh; source scripts/nodes.sh; write_prepared_marker')
+   sudo systemctl reset-failed deepseek1017.service && sudo systemctl start deepseek1017.service
    ```
 
-   The build and the copy to the worker leave pages parked on the per-CPU free lists; `start.sh` now counts them as
-   the engine does (`scripts/memavail.sh`) and waits up to `MIN_AVAIL_WAIT_S` (120 s) before refusing, so the round-1
-   restore failure (110.3 < 112 GiB right after the load) does not recur. A first start with spill on also hashes
-   each rank's ~106 GB weight file once (about a minute a Spark; cached beside the file afterwards).
+   The marker matters only for a manual `./start.sh` (`PREPARE` unset); its format changed with Mia's `0e7d421`. On
+   2026-10-30 :8888 was down 64 s (stop 7 s, load 5 s, start to healthy 51 s).
 
 6. **Check, then release the hold:**
 
@@ -124,9 +143,9 @@ KV-transfer exchange breaks, rank 0 exits with status 75 (a dead rank 1 within s
 stall bound and at most the 15 s drain deadline) and `/health` stops answering (docs/PORT-RECIPE.md "When the rank
 pair breaks"). Its start-up line says so (`... ends this server with status 75 ...`).
 
-`deepseek1017.service` is a oneshot with detached containers, so systemd never sees that exit:
-`deepseek1017-watchdog.timer` restarts the stack after its 3 failed `/health` checks 2 minutes apart, 4 to 6 minutes
-after the break. Nothing changes on gx10-a for that: the unit, its drop-in, the watchdog and its timer stay as they
+Since 2026-10-22 the unit is `Type=simple` with `FOREGROUND=1`, so systemd sees that exit and restarts the pair after
+`RestartSec` (60 s); `deepseek1017-watchdog.timer` remains the backstop for a hang (3 failed `/health` checks 2 minutes
+apart). The paragraphs below describe the earlier oneshot unit. Nothing changes on gx10-a for that: the unit, its drop-in, the watchdog and its timer stay as they
 are, and the hold keeps the watchdog off during manual work as before. The restart's `./stop.sh` (the unit's
 `ExecStop`) saves both ranks' logs before it removes the containers, so the newest
 `~/.cache/dsv41-tensorfold/logs/*-rank0.log.gz` ends with the engine's `exiting with status 75` and its cause.
@@ -157,10 +176,9 @@ Hold first (`touch ~/.deepseek1017-hold`), remove it at the end.
   ```
 
   `source scripts/config.sh; echo $IMAGE` in the restored tree must print the tag in `$d/image`.
-- **The previous image from the new tree** (quickest, no folder swap): in `scripts/local.sh` set every port setting
-  off explicitly (`SPILL_GIB=0 KV_SHARD=0 DISPLAY_KV_MIB=0`: an image without the port refuses the spill flags)
-  plus `IMAGE=<the tag in $d/image>` and `PREPARE=0`, restart the unit. `PREPARE=0` keeps `prepare.sh` from
-  rebuilding under that tag; never combine an old `IMAGE` with `PREPARE=1` or `auto`. Take both lines out again after.
+- **Not the previous image from the new tree:** since `0e7d421` start.sh passes settings an image on the older pin
+  refuses (`--graph-cap` to rank 1, among others). Roll back by swapping the folders, and restore the old tree's
+  `prepared.<old commit>` marker.
 - **Back to the stock server:** `sudo rm /etc/systemd/system/deepseek1017.service.d/fork.conf && sudo systemctl
   daemon-reload && sudo systemctl restart deepseek1017.service`. The stock checkout and its image were never changed.
 - **Spilled state** stays in each Spark's spill folder (`<SPILL_DIR>/native-spill-<compat>/`), owned by you after a
