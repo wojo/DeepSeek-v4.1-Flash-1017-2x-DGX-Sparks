@@ -11,7 +11,7 @@ and anything on the Sparks is the coordinator's: these are the steps it runs. No
 | unit | `deepseek1017.service`, enabled: since 2026-10-22 `Type=simple`, `FOREGROUND=1`, `PREPARE=0`, `Restart=on-failure`, `RestartSec=60s`, `StartLimitBurst=3` in 30 min (so the unit **never builds or prepares**: the image must be on both Sparks before a start), `ExecStartPre` waits for the worker; `deepseek1017-watchdog.timer` restarts it after 3 failed `/health` checks, never while `~/.deepseek1017-hold` exists |
 | drop-in | `/etc/systemd/system/deepseek1017.service.d/fork.conf`: `WorkingDirectory`, `ExecStart` (`start.sh`) and `ExecStop` (`stop.sh`) point at **`~/DeepSeek-port`**; `ExecStop` is resolved at stop time, so swap folders only while the unit is stopped |
 | fork checkout | `~/DeepSeek-port` on gx10-a: an earlier tree of this branch (or of the upstream `spill-kvshard`) with the fork's own `scripts/local.sh` |
-| image | `tensorfold-dsv41:exl3-tp2-067553852da3` on both Sparks since 2026-10-30 (Mia's main `0e7d421` + display reserve `0039`); the previous `exl3-tp2-2cacfb08137a` stays for a rollback |
+| image | `tensorfold-dsv41:exl3-tp2-4edb09692905` on both Sparks since 2026-10-31 (Mia's main `0e7d421` + display reserve `0039` + `0041` from #87 + `0042`: a short prompt cuts in under KV sharding); the previous `exl3-tp2-067553852da3` stays for a rollback |
 | stock checkout | `~/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks`, untouched (the unit's own paths) |
 
 This branch already carries both local fixes of the stock tree (`compiler-mirror.patch`: `ZIG_MIRRORS`;
