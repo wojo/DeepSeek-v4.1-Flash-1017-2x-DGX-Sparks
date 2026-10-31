@@ -8,8 +8,11 @@
   `DISPLAY_KV_MIB=1792`, an empty `POOL` derived as 5,218,304, each degrading where it cannot run. Short prompts no longer
   wait for a long one under KV sharding: `zig/patches/0042-kv-shard-pieces.patch` (Robert's, offered upstream) runs a
   sharded prompt pass in pieces and rebinds a paused pass's borrowed twins as it resumes, and `TF_FILL_CHUNKS=1`,
-  `TF_FILL_FIRST=4`, `TF_FILL_CUT_IN=8192` are this fork's defaults (`TF_FILL_CHUNKS=0`: every pass whole, the `0005`
-  interleave again). With the spill tier on, the run loop's service between two pieces needs nuk3s's
+  `TF_FILL_FIRST=1`, `TF_FILL_CUT_IN=8192` are this fork's defaults (`TF_FILL_CHUNKS=0`: every pass whole, the `0005`
+  interleave again). Measured on the pair (31 October 2026, image `exl3-tp2-4edb09692905`, empty spill store): a short
+  request sent 8 s into a cold 69,874-token prompt answers in 0.37-0.5 s (25.74 s before), the long reply's token sha
+  unchanged (`8173c254966c`) whether its twin is kept or taken back; a live stream's longest gap during a cold 31K
+  prompt 1.20 s (4.05 s with `TF_FILL_FIRST=4`, 1.16 s with the `0005` interleave); `tools/exact.py` 39/39 identical. With the spill tier on, the run loop's service between two pieces needs nuk3s's
   `0041-service-between-pieces.patch` ([pull request #87](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks/pull/87)), carried here.
 - README: the front page keeps the performance tables, requirements, quick start and the main settings (246 lines, was 595); the rest moved,
   unchanged except where it was out of date, to `docs/`: `requirements.md`, `how-it-works.md`, `configuration.md`, `memory-and-safety.md`,

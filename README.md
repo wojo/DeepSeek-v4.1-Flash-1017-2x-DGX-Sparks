@@ -108,7 +108,7 @@ Settings come from the environment, `scripts/local.sh` or `.env`; every setting 
 | `MIN_AVAIL_GIB`, `MEMGUARD_GIB` | 112, 2.5 | the memory `start.sh` demands, and the floor under which `scripts/memguard.sh` kills a rank |
 | `SPILL_GIB`, `KV_SHARD`, `POOL` | this fork: 64, 1, empty (derived: 5,218,304 with the display reserve); upstream: 0 (off), 0 (off), empty | [spill v2 and KV sharding](docs/spill-and-kv-sharding.md) |
 | `DISPLAY_KV_MIB` | this fork: 1792 (`0`: off); upstream: not present | display-reserve KV on a headless GB10 (ezoushen's #9; [configuration](docs/configuration.md)) |
-| `TF_FILL_CHUNKS`, `TF_FILL_FIRST`, `TF_FILL_CUT_IN` | this fork: 1, 4, 8192 (`TF_FILL_CHUNKS=0`: off); upstream: unset | a long prompt pass in pieces, short prompts cutting in between them, with `KV_SHARD=1` too (`0042`; [configuration](docs/configuration.md)) |
+| `TF_FILL_CHUNKS`, `TF_FILL_FIRST`, `TF_FILL_CUT_IN` | this fork: 1, 1, 8192 (`TF_FILL_CHUNKS=0`: off); upstream: unset | a long prompt pass in pieces, short prompts cutting in between them, with `KV_SHARD=1` too (`0042`; [configuration](docs/configuration.md)) |
 
 Extra arguments to `./start.sh` go to rank 0's `tensorfold-native serve` after the defaults; every `TENSORFOLD_*`, `TF_DS_*`,
 `TF_FILL_*` and `TF_SPILL_*` variable you set goes to both ranks.
